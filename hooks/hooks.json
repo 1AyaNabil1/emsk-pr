@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/skills/emsk-pr/scan.sh\"",
-            "timeout": 45,
+            "timeout": 55,
             "statusMessage": "emsk-pr: catching up on open PRs"
           }
         ]

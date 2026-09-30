@@ -54,7 +54,27 @@ case "$FILE" in
 esac
 [ -n "$REL" ] || exit 0
 
-MSG="$(jq -r --arg f "$REL" '
+# The scan runs at session start, so a long session edits against an old one.
+# Past the TTL, start a refresh in the background and answer from what is here:
+# this edit is never delayed, and the next one sees the new scan. A lock keeps a
+# burst of edits from starting a burst of refreshes.
+TTL="${EMSK_PR_TTL:-1800}"
+# GNU first: GNU `stat -f` means file-system status, which prints a report and
+# then fails, so a BSD-first chain would read that report as a number.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+AGE=$(( $(date +%s) - $(mtime "$CACHE") ))
+if [ "$AGE" -ge "$TTL" ]; then
+  LOCK="${CACHE%/*}/refresh.lock"
+  if [ -d "$LOCK" ] && [ $(( $(date +%s) - $(mtime "$LOCK") )) -gt 120 ]; then
+    rmdir "$LOCK" 2>/dev/null   # a refresh that died without cleaning up
+  fi
+  if mkdir "$LOCK" 2>/dev/null; then
+    # Every descriptor redirected, or the hook's caller would wait on the pipe.
+    ( cd "$ROOT" && bash "$HERE/scan.sh" --quiet; rmdir "$LOCK" ) </dev/null >/dev/null 2>&1 &
+  fi
+fi
+
+MSG="$(jq -r --arg f "$REL" --argjson age "$AGE" --argjson ttl "$TTL" '
   # gh returns author as an object; tolerate a bare string so a malformed cache
   # degrades the wording instead of swallowing the whole warning.
   def who: if (.author | type) == "object" then (.author.login // "?")
@@ -78,7 +98,7 @@ MSG="$(jq -r --arg f "$REL" '
      + (if ($hit.open | length) > 0 then
           [ "  OPEN: " + ([ $hit.open[0:2][] as $n
               | (.open[] | select(.number == $n)
-                 | "#\($n) \(.title | clip(40)) (@\(who))") ] | join("; "))
+                 | "#\($n) \(.title | clip(32)) (@\(who))") ] | join("; "))
             + (if ($hit.open | length) > 2
                then " (+\(($hit.open | length) - 2) more)" else "" end)
           , "  Read it before editing: gh pr diff \($r)\($hit.open[0]) -- \($f)" ]
@@ -86,24 +106,30 @@ MSG="$(jq -r --arg f "$REL" '
      # Merged PRs are numbers only: the symbol lines below already say what
      # changed, so a title here would cost more context than it buys.
      + (if ($hit.merged | length) > 0 then
-          [ "  ALREADY MERGED: "
+          [ "  MERGED INTO \(.base) after you branched: "
             + ($hit.merged | map("#\(.)") | some(3))
             + "  (gh pr view \($r)<n>)" ]
         else [] end)
      + (if $drifted then
-          [ "  This file changed on \($remote)/\(.base) after your branch point — your copy is older."
-            + " Read theirs: git show \($remote)/\(.base):\($f)" ]
+          [ "  Changed on \($remote)/\(.base) since you branched; your copy is older: git show \($remote)/\(.base):\($f)" ]
         else [] end)
+     # Removed names get the most room: re-adding one is the failure this
+     # whole tool exists to prevent.
      + (if $sym != null then
           ([]
            + (if ($sym.removed | length) > 0 then
                 [ "  REMOVED on \(.base): " + ($sym.removed | some(5))
-                  + "  <- do not reintroduce these" ] else [] end)
+                  + "  <- do not bring back" ] else [] end)
+           + (if (($sym.moved // []) | length) > 0 then
+                [ "  MOVED on \(.base): " + ($sym.moved | map("\(.name) -> \(.to)") | some(2))
+                  + "  <- still exist, use them there" ] else [] end)
            + (if ($sym.added | length) > 0 then
-                [ "  NEW on \(.base): " + ($sym.added | some(5))
-                  + "  <- prefer these over writing your own" ] else [] end)
+                [ "  NEW on \(.base): " + ($sym.added | some(3)) + "  <- use these" ] else [] end)
            + (if ($sym.changed | length) > 0 then
-                [ "  CHANGED on \(.base): " + ($sym.changed | some(5)) ] else [] end))
+                [ "  CHANGED on \(.base): " + ($sym.changed | some(3)) ] else [] end))
+        else [] end)
+     + (if $age >= $ttl then
+          [ "  (from a scan \($age / 3600 | floor)h\($age % 3600 / 60 | floor)m old; a refresh has started)" ]
         else [] end)
     ) | join("\n")
   end' "$CACHE" 2>/dev/null)"

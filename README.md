@@ -40,8 +40,9 @@ WHAT IS OPEN (4)
      shop/cart.py
        + added   compute_totals
        - removed _legacy_cart_key  <- do not bring these back
+       > moved   format_price -> shop/money.py  <- still exist; use them from there
 
-!! RECENTLY MERGED PRs THAT TOUCHED YOUR FILES
+!! MERGED INTO main AFTER YOUR BRANCH POINT, TOUCHING YOUR FILES
   #9 Drop the legacy cart key  (merged 2026-09-30)
      shared: shop/cart.py
 
@@ -80,9 +81,18 @@ To update: `/plugin marketplace update emsk-pr`, then `/plugin update emsk-pr@em
 - **Talks up when something is missing.** In a GitHub repo without `jq` or `gh`,
   or with `gh` logged out, you get one `emsk-pr:` line saying what to install.
 - **Works offline.** The last digest is served from cache, with its age.
-- **Cheap.** A refresh is two `gh pr list` calls in parallel plus one `git fetch`
-  of the base branch, a few seconds, cached for 30 minutes. The edit guard makes
-  no network calls at all.
+- **Only what you don't have.** A merged PR is reported only if it went into your
+  base branch *and* its merge commit is not in your branch yet. Release merges
+  into another branch, and anything you already pulled in, stay quiet.
+- **Complete file lists.** GitHub lists at most 100 files per PR; for bigger PRs
+  the full list comes from the REST API (or from local git, for merged ones).
+  When it can't be had, the digest says which PRs are incomplete.
+- **Moves aren't deletions.** A function that moved to another file is reported
+  as `> moved`, with where it went, not as removed.
+- **Stays fresh.** In a long session, an edit against a scan older than 30
+  minutes starts a new scan in the background. The edit is never delayed.
+- **Cheap.** A refresh takes a few seconds and is cached for 30 minutes. The edit
+  guard itself never waits on the network.
 - **Understands forks.** If you have an `upstream` remote, PRs are read from there,
   and your own PR is recognised by the fork it lives in.
 - **Skips your own PR.** The PR opened from your branch is labelled
@@ -116,9 +126,9 @@ Environment variables, for tuning:
 |---|---|---|
 | `EMSK_PR_TTL` | `1800` | Seconds before the cached digest is refreshed |
 | `EMSK_PR_OPEN_LIMIT` | `30` | Open PRs to read |
-| `EMSK_PR_MERGED_LIMIT` | `40` | Merged PRs to read |
-| `EMSK_PR_FLOOR_DAYS` | `7` | Always show at least this many days of merges |
-| `EMSK_PR_SYMBOL_FILES` | `25` | Max drifted files to scan for definition changes |
+| `EMSK_PR_MERGED_LIMIT` | `100` | Merges into the base since your branch point to read |
+| `EMSK_PR_FILE_PAGES` | `40` | REST requests per scan for PRs over 100 files |
+| `EMSK_PR_SYMBOL_FILES` | `25` | Max drifted files to report definition changes for |
 | `EMSK_PR_BLURBS` | `1` | `0` leaves PR descriptions out of the digest |
 | `EMSK_PR_HOME` | `~/.claude/emsk-pr` | Cache directory |
 
@@ -165,7 +175,7 @@ shape from `~/.codex/hooks.json`):
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "bash ~/.claude/skills/emsk-pr/scan.sh", "timeout": 45 }] }
+      { "hooks": [{ "type": "command", "command": "bash ~/.claude/skills/emsk-pr/scan.sh", "timeout": 55 }] }
     ],
     "PreToolUse": [
       { "matcher": "Edit|Write|MultiEdit|NotebookEdit",

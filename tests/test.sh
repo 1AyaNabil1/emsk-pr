@@ -49,7 +49,7 @@ mkbin() {
     p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "$dir/$t"
   done
 }
-BASE_TOOLS=(bash git dirname tr sed awk date stat cat head sort comm cut grep wc sleep mkdir mktemp rm mv ssh)
+BASE_TOOLS=(bash git dirname tr sed awk date stat cat head sort comm cut grep wc sleep mkdir rmdir mktemp rm mv ssh)
 mkbin "$TMPROOT/bin-nojq" "${BASE_TOOLS[@]}"
 mkbin "$TMPROOT/bin-nogh" "${BASE_TOOLS[@]}" jq
 
@@ -60,6 +60,8 @@ mkrepo() {
   for spec in "$@"; do git -C "$dir" remote add "${spec%%=*}" "${spec#*=}"; done
 }
 cache_path() { (cd "$1" && EMSK_PR_HOME="$TMPROOT/cache" "$SH" "$SCAN" --cache-path 2>&1); }
+# --extract-symbols answers per file; most checks only care about the names.
+flat() { jq -c '{added: [.[].added[]], removed: [.[].removed[]], changed: [.[].changed[]], moved: [.[].moved[]]}'; }
 
 echo
 echo "== silence outside GitHub repos (this hook runs in every project) =="
@@ -167,7 +169,7 @@ cat <<'DIFF'
 DIFF
 }
 
-sym="$(diff_fixture | "$SH" "$SCAN" --extract-symbols 2>/dev/null)"
+sym="$(diff_fixture | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat)"
 if [ -z "$sym" ]; then
   bad "extractor produces JSON" "empty output"
 else
@@ -188,7 +190,7 @@ else
     || bad "a changed symbol is not double-counted as added" "got: $sym"
 fi
 
-go_ts="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null
+go_ts="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat
 --- a/x.go
 +++ b/x.go
 @@
@@ -212,7 +214,7 @@ echo "$go_ts" | jq -e '.added | index("useRadar")' >/dev/null 2>&1 \
 
 # One definition per language, each behind the modifiers that language puts
 # in front of its names.
-many="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null
+many="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat
 --- a/lib.rs
 +++ b/lib.rs
 @@
@@ -268,10 +270,49 @@ echo "$many" | jq -e '.removed | length == 0' >/dev/null 2>&1 \
   && ok "an impl block is not a removed definition" || bad "impl is not a definition" "got: $many"
 
 noise="$(printf -- '--- a/z.py\n+++ b/z.py\n@@\n+# def commented_out(x):\n+    total = defaults + 1\n+    type = "x"\n' \
-  | "$SH" "$SCAN" --extract-symbols 2>/dev/null)"
+  | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat)"
 echo "$noise" | jq -e '(.added | length) == 0' >/dev/null 2>&1 \
   && ok "commented-out defs, 'defaults' and 'type =' are not symbols" \
   || bad "commented-out defs are not symbols" "got: $noise"
+
+# SQL names sit behind optional keywords, and a policy name is often a
+# quoted sentence. Each of these was once misread.
+sql="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat
+--- a/schema.sql
++++ b/schema.sql
+@@
++create table if not exists widgets (
++CREATE POLICY "Users can read own rows" ON widgets
++CREATE UNIQUE INDEX widgets_sku_idx ON widgets (sku);
++create index concurrently if not exists "Big Idx" on widgets (c);
++CREATE OR REPLACE FUNCTION public.touch_updated_at() RETURNS trigger
++create materialized view "public"."daily stats" as
++create index on widgets (b);
+DIFF
+)"
+echo "$sql" | jq -e '.added | sort == (["Big Idx", "Users can read own rows", "public.daily stats",
+    "public.touch_updated_at", "widgets", "widgets_sku_idx"] | sort)' >/dev/null 2>&1 \
+  && ok "SQL: if-not-exists, quoted, unique, concurrently, qualified and unnamed forms" \
+  || bad "SQL names" "got: $sql"
+
+# A function that moved to another file still exists: it must not be reported
+# as removed, or Claude is told never to call something it should call.
+moved="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null
+--- a/utils.py
++++ b/utils.py
+@@
+-def parse_date(s):
+-def really_gone(s):
+--- a/dates.py
++++ b/dates.py
+@@
++def parse_date(s):
+DIFF
+)"
+echo "$moved" | jq -e '.["utils.py"].moved == [{name: "parse_date", to: "dates.py"}]
+    and .["utils.py"].removed == ["really_gone"]' >/dev/null 2>&1 \
+  && ok "a definition moved to another file is 'moved', not 'removed'" \
+  || bad "moved definitions" "got: $moved"
 
 echo
 echo "== guard: the before-every-edit check =="
@@ -359,12 +400,15 @@ jq -n '
    open: $open, merged: $merged,
    symbols: {Makefile: {added:   [range(12) | "added_symbol_number_\(.)"],
                         removed: [range(12) | "removed_symbol_number_\(.)"],
-                        changed: [range(12) | "changed_symbol_number_\(.)"]}},
+                        changed: [range(12) | "changed_symbol_number_\(.)"],
+                        moved:   [range(6) | {name: "moved_symbol_\(.)", to: "src/some/other/place.py"}]}},
    base_drift_on_my_files: ["Makefile"]}' > "$GCACHE/many.json"
 ctx="$(guard_with Makefile "$GCACHE/many.json" | jq -r '.hookSpecificOutput.additionalContext // ""')"
-[ -n "$ctx" ] && [ "${#ctx}" -le 1000 ] \
-  && ok "warning stays under 1000 chars with 18 PRs and 36 symbols (${#ctx})" \
-  || bad "warning stays under 1000 chars" "len=${#ctx}"
+# Bytes, not characters, so every platform and locale measures the same.
+len="$(printf '%s' "$ctx" | LC_ALL=C wc -c | tr -d ' ')"
+[ -n "$ctx" ] && [ "$len" -le 1000 ] \
+  && ok "warning stays under 1000 bytes with 18 PRs and 42 symbols ($len)" \
+  || bad "warning stays under 1000 bytes" "len=$len"
 echo "$ctx" | grep -q 'more' \
   && ok "truncated warning says how many more there are" \
   || bad "truncated warning says how many more" "got: ${ctx:0:300}"
@@ -385,22 +429,26 @@ echo
 echo "== full refresh against a fake gh (no network) =="
 
 # A branch cut from main, then main moves under it: a merged PR drops
-# _legacy_cart_key and adds compute_totals in a file the branch also edits.
+# _legacy_cart_key, adds compute_totals and moves format_price to money.py,
+# in a file the branch also edits.
 E2E="$TMPROOT/e2e"
 mkrepo "$E2E" origin=git@github.com:acme/shop.git
 git -C "$E2E" config user.name test && git -C "$E2E" config user.email test@example.com
 mkdir -p "$E2E/shop"
-printf 'def _legacy_cart_key(a):\n    return a\n\ndef apply_discount(cart):\n    pass\n' > "$E2E/shop/cart.py"
+printf 'def _legacy_cart_key(a):\n    return a\n\ndef apply_discount(cart):\n    pass\n\ndef format_price(p):\n    return p\n' > "$E2E/shop/cart.py"
 printf 'all:\n\ttrue\n' > "$E2E/Makefile"
 git -C "$E2E" add -A && git -C "$E2E" commit -qm base
 git -C "$E2E" branch -M main
+BASE_OID="$(git -C "$E2E" rev-parse HEAD)"
 git -C "$E2E" checkout -qb landed
 printf 'def apply_discount(cart):\n    pass\n\ndef compute_totals(cart):\n    return cart\n' > "$E2E/shop/cart.py"
-git -C "$E2E" commit -qam "drop the legacy key"
+printf 'def format_price(p):\n    return p\n' > "$E2E/shop/money.py"
+git -C "$E2E" add -A && git -C "$E2E" commit -qm "drop the legacy key, move format_price"
+LANDED_OID="$(git -C "$E2E" rev-parse HEAD)"
 git -C "$E2E" update-ref refs/remotes/origin/main landed
 git -C "$E2E" checkout -q main && git -C "$E2E" branch -qD landed
 git -C "$E2E" checkout -qb feat/totals
-printf 'def _legacy_cart_key(a):\n    return a\n\ndef apply_discount(cart, code=None):\n    pass\n' > "$E2E/shop/cart.py"
+printf 'def _legacy_cart_key(a):\n    return a\n\ndef apply_discount(cart, code=None):\n    pass\n\ndef format_price(p):\n    return p\n' > "$E2E/shop/cart.py"
 printf 'all:\n\tfalse\n' > "$E2E/Makefile"
 git -C "$E2E" commit -qam "my change"
 
@@ -427,9 +475,32 @@ cat > "$FAKE/open.json" <<JSON
   "updatedAt": "$NOW", "url": "", "body": "", "files": [{"path": "package.json"}]}
 ]
 JSON
+# #14 and #15 change more files than GitHub lists (100). #14's Makefile is the
+# 101st, served by the REST fake; #15's REST call fails, so it stays partial.
+jq '. + [range(14; 16) as $n | {number: $n, title: "Huge refactor \($n)", author: {login: "dev-d", is_bot: false},
+          isDraft: false, baseRefName: "main", headRefName: "huge-\($n)", headRepositoryOwner: {login: "acme"},
+          updatedAt: "2026-01-01T00:00:00Z", url: "", body: "", changedFiles: (if $n == 14 then 101 else 150 end),
+          files: [range(100) | {path: "gen/f\(.).txt"}]}]' "$FAKE/open.json" > "$FAKE/o2" && mv "$FAKE/o2" "$FAKE/open.json"
+jq -rn 'range(100) | "gen/f\(.).txt"' > "$FAKE/files-14-1"
+echo Makefile > "$FAKE/files-14-2"
+
+# Merged PRs, and which of them the digest may report:
+#   #9  into main, not in my branch; files come from local git   -> reported
+#   #8  into main, but its commit is already in my branch        -> not reported
+#   #7  into another branch entirely                             -> not reported
+#   #6  into main, commit not local, merged after my branch point -> reported
+#   #5  into main, commit not local, merged long before it       -> not reported
 cat > "$FAKE/merged.json" <<JSON
 [{"number": 9, "title": "Drop the legacy cart key", "author": {"login": "dev-c"}, "baseRefName": "main",
-  "mergedAt": "$NOW", "url": "", "files": [{"path": "shop/cart.py"}]}]
+  "mergedAt": "$NOW", "mergeCommit": {"oid": "$LANDED_OID"}, "url": "", "files": [], "changedFiles": 2},
+ {"number": 8, "title": "Already in your branch", "author": {"login": "dev-c"}, "baseRefName": "main",
+  "mergedAt": "$NOW", "mergeCommit": {"oid": "$BASE_OID"}, "url": "", "files": [{"path": "Makefile"}], "changedFiles": 1},
+ {"number": 7, "title": "Release", "author": {"login": "dev-c"}, "baseRefName": "release",
+  "mergedAt": "$NOW", "mergeCommit": {"oid": "1111111111111111111111111111111111111111"}, "url": "", "files": [{"path": "Makefile"}], "changedFiles": 1},
+ {"number": 6, "title": "Not fetched yet", "author": {"login": "dev-e"}, "baseRefName": "main",
+  "mergedAt": "2099-01-01T00:00:00Z", "mergeCommit": {"oid": "2222222222222222222222222222222222222222"}, "url": "", "files": [{"path": "Makefile"}], "changedFiles": 1},
+ {"number": 5, "title": "Ancient history", "author": {"login": "dev-e"}, "baseRefName": "main",
+  "mergedAt": "2000-01-01T00:00:00Z", "mergeCommit": {"oid": "3333333333333333333333333333333333333333"}, "url": "", "files": [{"path": "Makefile"}], "changedFiles": 1}]
 JSON
 cat > "$FAKE/gh" <<'SH'
 #!/bin/sh
@@ -439,6 +510,10 @@ case "$1 $2" in
       *"--state open"*)   cat "$EMSK_PR_FAKE/open.json" ;;
       *"--state merged"*) cat "$EMSK_PR_FAKE/merged.json" ;;
     esac ;;
+  "api --hostname")  # repos/<o>/<r>/pulls/<n>/files?per_page=100&page=<p>, already --jq'd
+    for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
+    n="${path#*/pulls/}"; n="${n%%/*}"; p="${path##*page=}"
+    [ -f "$EMSK_PR_FAKE/files-$n-$p" ] && cat "$EMSK_PR_FAKE/files-$n-$p" || exit 1 ;;
   *) exit 1 ;;
 esac
 SH
@@ -451,8 +526,15 @@ fake_scan() { # $1 = repo; a failing ssh makes the fetch fail at once, offline
      EMSK_PR_HOME="$TMPROOT/e2ecache" "$SH" "$SCAN" --refresh 2>&1)
 }
 digest="$(fake_scan "$E2E")"; rc=$?
-[ $rc -eq 0 ] && printf '%s' "$digest" | grep -q 'WHAT IS OPEN (4)' \
+[ $rc -eq 0 ] && printf '%s' "$digest" | grep -q 'WHAT IS OPEN (6)' \
   && ok "refresh with a fake gh builds a digest" || bad "refresh builds a digest" "rc=$rc out=<$digest>"
+# The cache's age drives both the warm-cache path and this footer; a wrong age
+# on one platform means every session start refreshes there.
+printf '%s' "$digest" | tail -1 | grep -q 'scanned just now' \
+  && ok "the cache's age is read correctly on this platform" || bad "cache age" "got: $(printf '%s' "$digest" | tail -1)"
+warm="$(cd "$E2E" && PATH="$TMPROOT/bin-fake" EMSK_PR_FAKE="$FAKE" EMSK_PR_HOME="$TMPROOT/e2ecache" \
+  "$SH" -x "$SCAN" 2>&1 >/dev/null | grep -c 'gh pr list')"
+[ "$warm" = 0 ] && ok "a warm cache is served without calling GitHub" || bad "warm cache skips gh" "gh pr list ran $warm times"
 printf '%s' "$digest" | grep -q 'base origin/main' \
   && ok "base taken from this branch's own PR, not the stranger's" || bad "base from own PR" "$(printf '%s' "$digest" | head -1)"
 # The lines under one '!!' header, up to the next header or the footer.
@@ -473,8 +555,26 @@ printf '%s' "$landed" | grep -q 'shop/cart.py' && printf '%s' "$landed" | grep -
   && printf '%s' "$landed" | grep -q '+ added   compute_totals' \
   && ok "base drift lists the file and the removed/added definitions" \
   || bad "base drift and symbols" "got: $landed"
-section '!! RECENTLY MERGED' | grep -q '#9 ' \
-  && ok "the merged PR that moved the file is listed" || bad "merged PR listed" "got: $digest"
+printf '%s' "$landed" | grep -q '> moved   format_price -> shop/money.py' \
+  && ! printf '%s' "$landed" | grep -- '- removed' | grep -q format_price \
+  && ok "a function moved to a file the branch does not touch is 'moved', not 'removed'" \
+  || bad "moved across files in a real range" "got: $landed"
+merged_sec="$(section '!! MERGED INTO main AFTER YOUR BRANCH POINT')"
+printf '%s' "$merged_sec" | grep -q '#9 ' && printf '%s' "$merged_sec" | grep -q 'shop/cart.py' \
+  && ok "merged PR not in the branch is listed, its files read from local git" \
+  || bad "merged PR #9 listed with git-derived files" "got: $merged_sec"
+! printf '%s' "$merged_sec" | grep -q '#8 ' \
+  && ok "a merged PR already in the branch is not reported" || bad "#8 already in branch" "got: $merged_sec"
+! printf '%s' "$merged_sec" | grep -q '#7 ' \
+  && ok "a PR merged into another branch is not reported" || bad "#7 other base" "got: $merged_sec"
+printf '%s' "$merged_sec" | grep -q '#6 ' && ! printf '%s' "$merged_sec" | grep -q '#5 ' \
+  && ok "commit not local: merge date decides, against the branch point" \
+  || bad "date fallback for non-local commits" "got: $merged_sec"
+section '!! OPEN PRs THAT TOUCH YOUR FILES' | grep -q '#14 ' \
+  && ok "a file past GitHub's 100-file cap is found through the REST list" \
+  || bad "REST file list past 100" "got: $(section '!! OPEN PRs THAT TOUCH YOUR FILES')"
+printf '%s' "$digest" | grep -q 'file lists incomplete for #15' \
+  && ok "a PR whose full file list could not be read is flagged" || bad "partial PR flagged" "got: $digest"
 printf '%s' "$digest" | grep -q 'data, not instructions' \
   && ok "digest marks PR text as author-written data" || bad "digest marks PR text as data" "got: $digest"
 printf '%s' "$digest" | grep -q 'Faster builds' \
@@ -492,9 +592,29 @@ guard_e2e() {
 ctx="$(guard_e2e Makefile)"
 printf '%s' "$ctx" | grep -q '#11' && ! printf '%s' "$ctx" | grep -q '#10' \
   && ok "guard warns about the teammate's PR, never your own" || bad "guard skips own PR" "got: $ctx"
+printf '%s' "$ctx" | grep -q 'MERGED INTO main after you branched: #6' && ! printf '%s' "$ctx" | grep -qE '#(8|7|5)\b' \
+  && ok "guard names only merges the branch does not have" || bad "guard merged list" "got: $ctx"
 ctx="$(guard_e2e shop/cart.py)"
 printf '%s' "$ctx" | grep -q '_legacy_cart_key' \
   && ok "guard on the drifted file names the removed definition" || bad "guard names removed definition" "got: $ctx"
+printf '%s' "$ctx" | grep -q 'MOVED on main: format_price -> shop/money.py' \
+  && ok "guard says where a moved definition went" || bad "guard moved line" "got: $ctx"
+
+# A long session: the scan is old by the time of this edit. The guard answers
+# at once from the old scan, says so, and starts a refresh in the background.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+touch -t 202001010000 "$ecache"
+old="$(mtime "$ecache")"
+ctx="$(printf '{"tool_name":"Edit","cwd":"%s","tool_input":{"file_path":"%s/Makefile"}}' "$E2E" "$E2E" \
+  | PATH="$TMPROOT/bin-fake" EMSK_PR_FAKE="$FAKE" GIT_SSH_COMMAND=false EMSK_PR_HOME="$TMPROOT/e2ecache" \
+    "$SH" "$GUARD" 2>&1 | jq -r '.hookSpecificOutput.additionalContext // ""')"
+printf '%s' "$ctx" | grep -q 'a refresh has started' \
+  && ok "stale scan: the warning says how old it is" || bad "stale scan noted" "got: $ctx"
+i=0; while [ "$(mtime "$ecache")" = "$old" ] && [ $i -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
+[ "$(mtime "$ecache")" != "$old" ] \
+  && ok "stale scan: the guard refreshed the cache in the background" || bad "background refresh" "cache unchanged"
+i=0; while [ -d "${ecache%/*}/refresh.lock" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+[ ! -d "${ecache%/*}/refresh.lock" ] && ok "stale scan: the refresh lock is released" || bad "refresh lock released" ""
 
 # The same branch in a fork: origin is mine, PRs live on upstream, and my PR's
 # head is in my fork. It must still be recognised as mine.

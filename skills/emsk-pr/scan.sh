@@ -24,9 +24,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EMSK_PR_HOME="${EMSK_PR_HOME:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/emsk-pr}"
 TTL="${EMSK_PR_TTL:-1800}"          # seconds before the cache is stale
 OPEN_LIMIT="${EMSK_PR_OPEN_LIMIT:-30}"
-MERGED_LIMIT="${EMSK_PR_MERGED_LIMIT:-40}"
-FLOOR_DAYS="${EMSK_PR_FLOOR_DAYS:-7}"   # always show at least this much history
-SYMBOL_FILES="${EMSK_PR_SYMBOL_FILES:-25}"  # cap on files we symbol-diff
+MERGED_LIMIT="${EMSK_PR_MERGED_LIMIT:-100}"  # merges into the base since the branch point
+FILE_PAGES="${EMSK_PR_FILE_PAGES:-40}"  # REST requests per scan for PRs over 100 files
+SYMBOL_FILES="${EMSK_PR_SYMBOL_FILES:-25}"  # cap on files we report definitions for
 BLURBS="${EMSK_PR_BLURBS:-1}"       # 0 leaves PR descriptions out of the digest
 
 # A hook has no terminal to answer a prompt on, so a credential or passphrase
@@ -46,12 +46,13 @@ case "${1:-}" in
 esac
 
 # ---------------------------------------------------------------- symbols ---
-# Pull function/method/class/type names out of a unified diff and sort them into
-# added (plus side only), removed (minus side only) and changed (both sides).
-# A name on both sides means the signature or body moved, not that it vanished.
-extract_symbols() {
-  local pairs plus minus
-  pairs="$(awk '
+# Pull function/method/class/type/SQL-object names out of a unified diff, one
+# row per definition line: side <TAB> file <TAB> name. The file comes from the
+# `--- a/…` / `+++ b/…` headers, so a diff must use git's default a/ b/ prefixes.
+symbol_rows() {
+  awk '
+    /^--- (a\/|\/dev\/null)/   { mf = ($0 ~ /^--- \/dev\/null/)   ? "" : substr($0, 7); next }
+    /^\+\+\+ (b\/|\/dev\/null)/ { pf = ($0 ~ /^\+\+\+ \/dev\/null/) ? "" : substr($0, 7); next }
     {
       side = substr($0, 1, 1)
       if (side != "+" && side != "-") next
@@ -68,10 +69,15 @@ extract_symbols() {
         # JS/TS arrow functions: export const useThing = (...) =>
         name = substr(body, RSTART, RLENGTH)
         sub(/^(export[ \t]+)?(const|let|var)[ \t]+/, "", name)
-      } else if (match(low, /^create[ \t]+(or[ \t]+replace[ \t]+)?(function|view|table|policy|trigger|index)[ \t]+[a-z_"][a-z0-9_".]*/)) {
-        name = substr(body, RSTART, RLENGTH)
-        sub(/^[Cc][Rr][Ee][Aa][Tt][Ee][ \t]+([Oo][Rr][ \t]+[Rr][Ee][Pp][Ll][Aa][Cc][Ee][ \t]+)?[A-Za-z]+[ \t]+/, "", name)
-        gsub(/"/, "", name)
+      } else if (match(low, /^create[ \t]+(or[ \t]+replace[ \t]+)?((temp|temporary|unlogged|materialized|unique|recursive|constraint|global|local)[ \t]+)*(function|procedure|view|table|policy|trigger|index|type|sequence|schema|domain|extension)[ \t]+(concurrently[ \t]+)?(if[ \t]+not[ \t]+exists[ \t]+)?/)) {
+        # SQL: the name follows the keywords, and may be quoted (a policy
+        # name is often a sentence) or schema-qualified.
+        rest = substr(body, RLENGTH + 1)
+        if (match(rest, /^("[^"]*"|[A-Za-z_][A-Za-z0-9_$]*)(\.("[^"]*"|[A-Za-z_][A-Za-z0-9_$]*))*/)) {
+          name = substr(rest, 1, RLENGTH); gsub(/"/, "", name)
+          # `create index on t (…)` has no name of its own
+          if (tolower(name) == "on") name = ""
+        }
       } else {
         # Strip leading modifiers and annotations, so `pub(crate) async fn x`,
         # `public static function x` and `@objc open class X` all reduce to a
@@ -93,20 +99,33 @@ extract_symbols() {
           if (name == "extends" || name == "implements") name = ""
         }
       }
-      if (name != "") print side name
+      if (name != "") print side "\t" (side == "+" ? pf : mf) "\t" name
     }
-  ')"
+  '
+}
 
-  plus="$(printf '%s\n'  "$pairs" | grep '^+' | cut -c2- | sort -u)"
-  minus="$(printf '%s\n' "$pairs" | grep '^-' | cut -c2- | sort -u)"
-
-  jq -n \
-    --arg a "$(comm -23 <(printf '%s\n' "$plus") <(printf '%s\n' "$minus"))" \
-    --arg r "$(comm -13 <(printf '%s\n' "$plus") <(printf '%s\n' "$minus"))" \
-    --arg c "$(comm -12 <(printf '%s\n' "$plus") <(printf '%s\n' "$minus"))" \
-    '{added:   ($a | split("\n") | map(select(length > 0))),
-      removed: ($r | split("\n") | map(select(length > 0))),
-      changed: ($c | split("\n") | map(select(length > 0)))}'
+# Sort each file's names into added (plus side only), removed (minus side only)
+# and changed (both sides: the signature or body moved, it did not vanish).
+# A name removed from one file but added to another in the same diff is moved,
+# not removed: it still exists, and calling it from its new home is right.
+extract_symbols() {
+  symbol_rows | jq -R -s '
+    split("\n") | map(select(length > 0) | split("\t") | {s: .[0], f: .[1], n: .[2]}) as $rows
+    | ($rows | map(select(.s == "+")) | group_by(.n)
+       | map({key: .[0].n, value: (map(.f) | unique)}) | from_entries) as $added_in
+    | $rows | group_by(.f) | map(
+        .[0].f as $f
+        | (map(select(.s == "+") | .n) | unique) as $p
+        | (map(select(.s == "-") | .n) | unique) as $m
+        | ($m - $p) as $gone
+        | {key: $f, value: {
+            added:   ($p - $m),
+            changed: [ $p[] | select(. as $x | $m | any(. == $x)) ],
+            removed: [ $gone[] | select((($added_in[.] // []) - [$f]) | length == 0) ],
+            moved:   [ $gone[] | . as $x | (($added_in[$x] // []) - [$f])
+                       | select(length > 0) | {name: $x, to: .[0]} ] }})
+    | from_entries
+    | with_entries(select((.value.added + .value.removed + .value.changed + .value.moved) | length > 0))'
 }
 
 if [ "$MODE" = "extract" ]; then
@@ -221,7 +240,9 @@ cache_age() {
   [ -f "$CACHE" ] || { echo 999999; return; }
   local now mt
   now=$(date +%s)
-  mt=$(stat -f %m "$CACHE" 2>/dev/null || stat -c %Y "$CACHE" 2>/dev/null || echo 0)
+  # GNU first: GNU `stat -f` means file-system status, which prints a report
+  # and then fails, so a BSD-first chain would read that report as a number.
+  mt=$(stat -c %Y "$CACHE" 2>/dev/null || stat -f %m "$CACHE" 2>/dev/null || echo 0)
   echo $((now - mt))
 }
 
@@ -330,24 +351,29 @@ TMP="$(mktemp -d)" || exit 0
 trap 'rm -rf "$TMP"' EXIT
 
 GH_REPO="$PR_HOST/$PR_SLUG"
+CFG_BASE="$(git -C "$ROOT" config --get emsk-pr.base 2>/dev/null)"
 
-# Both lists at once: this runs while a session is starting.
-run_timeout 20 gh pr list --repo "$GH_REPO" --state open --limit "$OPEN_LIMIT" \
-  --json number,title,author,isDraft,baseRefName,headRefName,headRepositoryOwner,updatedAt,url,body,files \
+# Open PRs, and, when the base branch has to be guessed, which branches recent
+# merges went into. Both at once: this runs while a session is starting.
+run_timeout 15 gh pr list --repo "$GH_REPO" --state open --limit "$OPEN_LIMIT" \
+  --json number,title,author,isDraft,baseRefName,headRefName,headRepositoryOwner,updatedAt,url,body,files,changedFiles \
   > "$TMP/open.json" 2>/dev/null &
 open_pid=$!
-run_timeout 20 gh pr list --repo "$GH_REPO" --state merged --limit "$MERGED_LIMIT" \
-  --json number,title,author,baseRefName,mergedAt,url,files \
-  > "$TMP/merged.json" 2>/dev/null &
-merged_pid=$!
+echo '[]' > "$TMP/bases.json"
+bases_pid=""
+if [ -z "$CFG_BASE" ]; then
+  run_timeout 15 gh pr list --repo "$GH_REPO" --state merged --limit 40 --json baseRefName \
+    > "$TMP/bases.json" 2>/dev/null &
+  bases_pid=$!
+fi
 wait "$open_pid" 2>/dev/null
-wait "$merged_pid" 2>/dev/null
+[ -n "$bases_pid" ] && wait "$bases_pid" 2>/dev/null
 
 # No open list means GitHub was not reached. Keep the last good cache rather
 # than overwrite it with an empty one.
 jq -e 'type == "array"' "$TMP/open.json" >/dev/null 2>&1 \
   || fallback "could not reach $PR_HOST to list pull requests (offline, or the gh token expired)"
-jq -e 'type == "array"' "$TMP/merged.json" >/dev/null 2>&1 || echo '[]' > "$TMP/merged.json"
+jq -e 'type == "array"' "$TMP/bases.json" >/dev/null 2>&1 || echo '[]' > "$TMP/bases.json"
 
 # The branch's own PR is the one whose head lives where this branch is pushed.
 # Matching on the branch name alone would pick up a stranger's fork PR from a
@@ -360,16 +386,17 @@ HEAD_OWNER=""
 if url="$(git -C "$ROOT" remote get-url "$PUSH_REMOTE" 2>/dev/null)" && parse_remote "$url"; then
   HEAD_OWNER="${RSLUG%%/*}"
 fi
+# shellcheck disable=SC2016  # jq source: jq expands $b and $me, not the shell
+OWN='def own($b; $me): .headRefName == $b and ($me == "" or
+       ((.headRepositoryOwner.login // "") | ascii_downcase) == ($me | ascii_downcase)); '
 
 # Base branch: configured, else what my own PR targets, else what most merged
 # PRs target, else the remote's default branch.
-BASE="$(git -C "$ROOT" config --get emsk-pr.base 2>/dev/null)"
-[ -n "$BASE" ] || BASE="$(jq -r --arg b "$BRANCH" --arg me "$HEAD_OWNER" '
-  [.[] | select(.headRefName == $b)
-       | select($me == "" or ((.headRepositoryOwner.login // "") | ascii_downcase) == ($me | ascii_downcase))
-       | .baseRefName] | first // empty' "$TMP/open.json")"
+BASE="$CFG_BASE"
+[ -n "$BASE" ] || BASE="$(jq -r --arg b "$BRANCH" --arg me "$HEAD_OWNER" "$OWN"'
+  [.[] | select(own($b; $me)) | .baseRefName] | first // empty' "$TMP/open.json")"
 [ -n "$BASE" ] || BASE="$(jq -r \
-  '[.[].baseRefName] | group_by(.) | max_by(length) | .[0] // empty' "$TMP/merged.json")"
+  '[.[].baseRefName] | group_by(.) | max_by(length) | .[0] // empty' "$TMP/bases.json")"
 [ -n "$BASE" ] || BASE="$(git -C "$ROOT" symbolic-ref --short -q "refs/remotes/$REMOTE_NAME/HEAD" 2>/dev/null \
                         | sed "s#^$REMOTE_NAME/##")"
 [ -n "$BASE" ] || BASE="$(run_timeout 6 gh repo view "$GH_REPO" --json defaultBranchRef \
@@ -385,10 +412,89 @@ fi
 # An explicit refspec updates the tracking ref even in a single-branch clone,
 # where a bare `git fetch <remote> <branch>` would only write FETCH_HEAD.
 BASE_REF="refs/remotes/$REMOTE_NAME/$BASE"
-run_timeout 12 git -C "$ROOT" fetch --quiet --no-tags "$REMOTE_NAME" \
-  "+refs/heads/$BASE:$BASE_REF" >/dev/null 2>&1 || true
+fetch_base() {
+  run_timeout 12 git -C "$ROOT" fetch --quiet --no-tags "$REMOTE_NAME" \
+    "+refs/heads/$BASE:$BASE_REF" >/dev/null 2>&1 || true
+}
+
+# `gh pr list` names at most 100 files per PR. For a bigger PR that could
+# collide with this branch, read the REST file list instead: one request per
+# page, every page at once, in the background while the rest of the scan runs.
+# FILE_PAGES caps the requests per scan; a PR past it keeps its partial list,
+# and the digest says so.
+PAGES_LEFT="$FILE_PAGES"
+fetch_files() { # $1 = PR number, $2 = its changedFiles
+  local n="$1" pages=$(( ($2 + 99) / 100 )) p=1
+  [ "$pages" -le 30 ] && [ "$pages" -le "$PAGES_LEFT" ] || return 0
+  PAGES_LEFT=$((PAGES_LEFT - pages))
+  while [ "$p" -le "$pages" ]; do
+    run_timeout 8 gh api --hostname "$PR_HOST" "repos/$PR_SLUG/pulls/$n/files?per_page=100&page=$p" \
+      --jq '.[].filename' > "$TMP/page-$n-$p" 2>/dev/null &
+    p=$((p + 1))
+  done
+}
+while read -r n total; do fetch_files "$n" "$total"; done < <(jq -r --arg b "$BRANCH" --arg me "$HEAD_OWNER" "$OWN"'
+  .[] | select(own($b; $me) | not) | select((.changedFiles // 0) > (.files // [] | length))
+      | "\(.number) \(.changedFiles)"' "$TMP/open.json")
+
+# Merges into the base since the branch point, found from the base ref already
+# here so the search can run alongside the fetch. A stale ref can only put the
+# branch point earlier, which widens the search; the ancestry check trims it.
+MB="$(git -C "$ROOT" merge-base HEAD "$BASE_REF" 2>/dev/null || true)"
+fetched=""
+if [ -z "$MB" ]; then fetch_base; fetched=1; MB="$(git -C "$ROOT" merge-base HEAD "$BASE_REF" 2>/dev/null || true)"; fi
+SINCE=()
+if [ -n "$MB" ]; then
+  mb_epoch="$(git -C "$ROOT" log -1 --format=%ct "$MB" 2>/dev/null || echo 0)"
+  # a day of slack: GitHub's merge time and git's commit time can disagree
+  since="$(fmt_epoch $((mb_epoch - 86400)) +%Y-%m-%d)" && SINCE=(--search "merged:>=$since")
+fi
+[ -n "$fetched" ] || { fetch_base & fetch_pid=$!; }
+run_timeout 15 gh pr list --repo "$GH_REPO" --state merged --base "$BASE" \
+  ${SINCE[@]+"${SINCE[@]}"} --limit "$MERGED_LIMIT" \
+  --json number,title,author,baseRefName,mergedAt,mergeCommit,url,files,changedFiles \
+  > "$TMP/merged.json" 2>/dev/null
+[ -n "$fetched" ] || wait "$fetch_pid" 2>/dev/null
+jq -e 'type == "array"' "$TMP/merged.json" >/dev/null 2>&1 || echo '[]' > "$TMP/merged.json"
 
 MB="$(git -C "$ROOT" merge-base HEAD "$BASE_REF" 2>/dev/null || true)"
+MB_TIME=""
+[ -n "$MB" ] && MB_TIME="$(fmt_epoch "$(git -C "$ROOT" log -1 --format=%ct "$MB")" +%Y-%m-%dT%H:%M:%SZ)"
+
+# A merged PR matters only while its commit is not in this branch. One merged
+# before the branch point, or brought in by merging the base since, is already
+# here whatever its date. When the commit is not local, fall back to the date.
+: > "$TMP/have.txt"; : > "$TMP/unknown.txt"
+jq -r '.[] | "\(.number) \(.mergeCommit.oid // "-")"' "$TMP/merged.json" | while read -r n oid; do
+  if [ "$oid" != "-" ] && git -C "$ROOT" cat-file -e "$oid^{commit}" 2>/dev/null; then
+    git -C "$ROOT" merge-base --is-ancestor "$oid" HEAD 2>/dev/null && echo "$n" >> "$TMP/have.txt"
+  else
+    echo "$n" >> "$TMP/unknown.txt"
+  fi
+done
+HAVE_JSON="$(jq -R -s 'split("\n") | map(select(length > 0) | {key: ., value: true}) | from_entries' < "$TMP/have.txt")"
+UNKNOWN_JSON="$(jq -R -s 'split("\n") | map(select(length > 0) | {key: ., value: true}) | from_entries' < "$TMP/unknown.txt")"
+jq --arg base "$BASE" --arg mbtime "$MB_TIME" --argjson have "$HAVE_JSON" --argjson unknown "$UNKNOWN_JSON" '
+  map(select(.baseRefName == $base)
+      | select($have[.number | tostring] | not)
+      | select(($unknown[.number | tostring] | not) or .mergedAt >= $mbtime))' \
+  "$TMP/merged.json" > "$TMP/merged_new.json"
+MERGED_CAPPED="$(jq 'length' "$TMP/merged.json")"
+[ "$MERGED_CAPPED" -ge "$MERGED_LIMIT" ] && MERGED_CAPPED=true || MERGED_CAPPED=false
+
+# A big merged PR's commit is local by now, so its files come from git for
+# free. The count must match GitHub's: a rebase-merge's commit holds only the
+# PR's last commit, and then the REST API has to answer instead.
+while read -r n oid total; do
+  if [ "$oid" != "-" ] && git -C "$ROOT" cat-file -e "$oid^{commit}" 2>/dev/null &&
+     git -C "$ROOT" diff --name-only "$oid^1" "$oid" > "$TMP/local-$n" 2>/dev/null &&
+     [ "$(wc -l < "$TMP/local-$n" | tr -d ' ')" -eq "$total" ]; then
+    mv "$TMP/local-$n" "$TMP/files-$n.txt"
+  else
+    fetch_files "$n" "$total"
+  fi
+done < <(jq -r '.[] | select((.changedFiles // 0) > (.files // [] | length))
+                | "\(.number) \(.mergeCommit.oid // "-") \(.changedFiles)"' "$TMP/merged_new.json")
 
 # My files: committed since the branch point, plus staged, unstaged and new.
 {
@@ -406,36 +512,37 @@ if [ -n "$MB" ]; then
 fi
 comm -12 "$TMP/mine.txt" "$TMP/drift.txt" > "$TMP/drift_mine.txt"
 
-# Only merged PRs newer than the branch point matter — with a floor so a branch
-# cut this morning still shows you the week.
-MB_EPOCH=0
-[ -n "$MB" ] && MB_EPOCH="$(git -C "$ROOT" log -1 --format=%ct "$MB" 2>/dev/null || echo 0)"
-FLOOR_EPOCH=$(( $(date +%s) - FLOOR_DAYS * 86400 ))
-CUTOFF_EPOCH=$MB_EPOCH
-[ "$FLOOR_EPOCH" -lt "$CUTOFF_EPOCH" ] && CUTOFF_EPOCH=$FLOOR_EPOCH
-CUTOFF="$(fmt_epoch "$CUTOFF_EPOCH" +%Y-%m-%dT%H:%M:%SZ || echo "1970-01-01T00:00:00Z")"
-
-# Symbols added/removed/changed on the base branch, per file I also touch.
+# Definitions added/removed/changed/moved on the base branch, for the files I
+# also touch. The whole range is read at once, so a function that moved to a
+# file I do not touch is still seen arriving there.
 echo '{}' > "$TMP/symbols.json"
 if [ -n "$MB" ] && [ -s "$TMP/drift_mine.txt" ]; then
-  echo '{}' > "$TMP/symacc.json"
-  n=0
-  while IFS= read -r f; do
-    n=$((n + 1)); [ "$n" -gt "$SYMBOL_FILES" ] && break
-    case "$f" in
-      *.py|*.go|*.ts|*.tsx|*.mts|*.cts|*.js|*.jsx|*.mjs|*.cjs|*.svelte|*.vue|*.sql) ;;
-      *.rs|*.rb|*.kt|*.kts|*.swift|*.java|*.cs|*.php|*.scala) ;;
-      *) continue ;;
-    esac
-    s="$(git -C "$ROOT" diff "$MB" "$BASE_REF" -- "$f" 2>/dev/null | extract_symbols)"
-    [ -n "$s" ] || continue
-    printf '%s' "$s" | jq -e '(.added|length) + (.removed|length) + (.changed|length) > 0' \
-      >/dev/null 2>&1 || continue
-    jq --arg f "$f" --argjson s "$s" '. + {($f): $s}' "$TMP/symacc.json" > "$TMP/symacc2.json" \
-      && mv "$TMP/symacc2.json" "$TMP/symacc.json"
-  done < "$TMP/drift_mine.txt"
-  mv "$TMP/symacc.json" "$TMP/symbols.json"
+  run_timeout 10 git -C "$ROOT" diff --no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/ \
+    "$MB" "$BASE_REF" -- '*.py' '*.go' '*.ts' '*.tsx' '*.mts' '*.cts' '*.js' '*.jsx' '*.mjs' '*.cjs' \
+    '*.svelte' '*.vue' '*.sql' '*.rs' '*.rb' '*.kt' '*.kts' '*.swift' '*.java' '*.cs' '*.php' '*.scala' \
+    > "$TMP/range.diff" 2>/dev/null
+  MINE_DRIFT_JSON="$(head -n "$SYMBOL_FILES" "$TMP/drift_mine.txt" | jq -R -s 'split("\n") | map(select(length > 0))')"
+  extract_symbols < "$TMP/range.diff" 2>/dev/null \
+    | jq --argjson keep "$MINE_DRIFT_JSON" 'with_entries(select(.key as $k | $keep | any(. == $k)))' \
+    > "$TMP/symbols.json" 2>/dev/null
+  jq -e 'type == "object"' "$TMP/symbols.json" >/dev/null 2>&1 || echo '{}' > "$TMP/symbols.json"
 fi
+
+# Collect the file-list pages started above. Each request has its own timeout,
+# so this wait is bounded.
+wait
+for f in "$TMP"/page-*; do
+  [ -e "$f" ] || continue
+  n="${f##*/page-}"; n="${n%-*}"
+  cat "$f" >> "$TMP/files-$n.txt"
+done
+echo '{}' > "$TMP/big.json"
+for f in "$TMP"/files-*.txt; do
+  [ -s "$f" ] || continue
+  n="${f##*/files-}"; n="${n%.txt}"
+  jq --arg n "$n" --rawfile l "$f" '. + {($n): ($l | split("\n") | map(select(length > 0)) | unique)}' \
+    "$TMP/big.json" > "$TMP/big2.json" && mv "$TMP/big2.json" "$TMP/big.json"
+done
 
 MINE_JSON="$(jq -R -s 'split("\n") | map(select(length > 0))' < "$TMP/mine.txt")"
 DRIFT_JSON="$(jq -R -s 'split("\n") | map(select(length > 0))' < "$TMP/drift_mine.txt")"
@@ -450,32 +557,36 @@ fi
 jq -n \
   --arg repo "$PR_SLUG" --arg host "$PR_HOST" --arg remote "$REMOTE_NAME" \
   --arg branch "$BRANCH" --arg base "$BASE" --arg ghflag "$GH_FLAG" --arg me "$HEAD_OWNER" \
-  --arg mb "$MB" --arg cutoff "$CUTOFF" \
+  --arg mb "$MB" --argjson capped "$MERGED_CAPPED" \
   --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --argjson mine "$MINE_JSON" \
   --argjson drift "$DRIFT_JSON" \
   --slurpfile open "$TMP/open.json" \
-  --slurpfile merged "$TMP/merged.json" \
-  --slurpfile symbols "$TMP/symbols.json" '
+  --slurpfile merged "$TMP/merged_new.json" \
+  --slurpfile big "$TMP/big.json" \
+  --slurpfile symbols "$TMP/symbols.json" "$OWN"'
   ($mine | map({key: ., value: true}) | from_entries) as $mineset |
+  # Full file lists where the 100-file cap was hit and the REST call came back;
+  # anything still short is flagged, so a quiet guard is not read as all-clear.
+  def files: ($big[0][.number | tostring] // (.files // [] | map(.path)));
+  def partial: (.changedFiles // 0) > (files | length);
   ($open[0] | map(
-     . + {files: (.files // [] | map(.path)),
+     . + {files: files, partial: partial,
           # The PR opened from this very branch shares every file with it; it
           # is not somebody else colliding with you.
-          own: (.headRefName == $branch and ($me == "" or
-                ((.headRepositoryOwner.login // "") | ascii_downcase) == ($me | ascii_downcase))),
+          own: own($branch; $me),
           blurb: ((.body // "") | split("\n") | map(select(test("\\S")))
                   | map(select(test("^[#>`|<-]") | not)) | first // ""
                   | gsub("\\*\\*|`|__"; "") | gsub("\\s+"; " ")
                   | if length > 120 then (.[0:120] | sub("\\s\\S*$"; "")) + "…" else . end)}
    ) | map(. + {overlap: (if .own then [] else .files | map(select($mineset[.])) end)})) as $o |
-  ($merged[0] | map(select(.mergedAt >= $cutoff))
-   | map(. + {files: (.files // [] | map(.path))})
+  ($merged[0]
+   | map(. + {files: files, partial: partial})
    | map(. + {overlap: (.files | map(select($mineset[.])))})) as $m |
   {
     generated_at: $generated, repo: $repo, host: $host, remote: $remote,
     branch: $branch, base: $base, gh_repo_flag: $ghflag,
-    merge_base: $mb, cutoff: $cutoff,
+    merge_base: $mb, merged_capped: $capped,
     my_files: $mine,
     base_drift_on_my_files: $drift,
     open: $o,
@@ -516,6 +627,8 @@ SHARED='def shared: if length > 4 then (.[0:4] | join(" · ")) + " (+\(length - 
   jq -r '[.open[] | select(.author.is_bot == true)] | select(length > 0) |
     "  + \(length) bot PR\(if length > 1 then "s" else "" end): \(map("#\(.number)") | join(" "))"
     + " (\(map(.author.login) | unique | join(", ")))"' "$CACHE"
+  jq -r '[.open[], .merged[] | select(.partial and (.own | not))] | select(length > 0) |
+    "  (file lists incomplete for \(map("#\(.number)") | join(" ")): a collision in them can be missed)"' "$CACHE"
 
   if jq -e '[.open[] | select(.overlap | length > 0)] | length > 0' "$CACHE" >/dev/null; then
     printf '\n!! OPEN PRs THAT TOUCH YOUR FILES — read these before you edit\n'
@@ -534,14 +647,17 @@ SHARED='def shared: if length > 4 then (.[0:4] | join(" · ")) + " (+\(length - 
         "     \(.key)"
         + (if (.value.added   | length) > 0 then "\n       + added   \(.value.added   | join(", "))" else "" end)
         + (if (.value.removed | length) > 0 then "\n       - removed \(.value.removed | join(", "))  <- do not bring these back" else "" end)
+        + (if ((.value.moved // []) | length) > 0 then "\n       > moved   \(.value.moved | map("\(.name) -> \(.to)") | join(", "))  <- still exist; use them from there" else "" end)
         + (if (.value.changed | length) > 0 then "\n       ~ changed \(.value.changed | join(", "))" else "" end)' "$CACHE"
     fi
   fi
 
   if jq -e '[.merged[] | select(.overlap | length > 0)] | length > 0' "$CACHE" >/dev/null; then
-    printf '\n!! RECENTLY MERGED PRs THAT TOUCHED YOUR FILES\n'
+    printf '\n!! MERGED INTO %s AFTER YOUR BRANCH POINT, TOUCHING YOUR FILES\n' "$BASE"
     jq -r "$SHARED"'[.merged[] | select(.overlap | length > 0)] | sort_by(.mergedAt) | reverse | .[] |
       "  #\(.number) \(.title)  (merged \(.mergedAt[0:10]))\n     shared: \(.overlap | shared)"' "$CACHE"
+    jq -r 'select(.merged_capped) |
+      "  (only the newest merges were read; the file list above under LANDED ON is complete)"' "$CACHE"
   fi
 } > "$DIGEST" 2>/dev/null
 
