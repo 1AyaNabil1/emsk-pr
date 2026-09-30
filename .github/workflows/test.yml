@@ -33,8 +33,7 @@ jobs:
         if: runner.os == 'macOS'
         env:
           GH_TOKEN: ${{ github.token }}
-          EMSK_PR_TEST_SHELL: /bin/bash
-        run: bash tests/test.sh
+        run: /bin/bash tests/test.sh
 
   shellcheck:
     runs-on: ubuntu-latest

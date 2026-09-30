@@ -6,7 +6,9 @@
 # repo you run this from — and skip when gh is not logged in. The safety tests
 # (which must be silent everywhere) always run.
 #
-#   EMSK_PR_TEST_SHELL=/bin/bash bash tests/test.sh   run the scripts under macOS's bash 3.2
+#   /bin/bash tests/test.sh   everything under macOS's bash 3.2: the harness and the scripts
+#
+# The scripts run under the same bash as this file, unless EMSK_PR_TEST_SHELL says otherwise.
 
 # ok() always succeeds, so `check && ok || bad` never runs both.
 # shellcheck disable=SC2015
@@ -17,7 +19,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL="$HERE/../skills/emsk-pr"
 SCAN="$SKILL/scan.sh"
 GUARD="$SKILL/guard.sh"
-SH="${EMSK_PR_TEST_SHELL:-bash}"
+SH="${EMSK_PR_TEST_SHELL:-$BASH}"
 
 PASS=0
 FAIL=0
@@ -190,7 +192,9 @@ else
     || bad "a changed symbol is not double-counted as added" "got: $sym"
 fi
 
-go_ts="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat
+# Fixtures are written to files and fed in, never heredocs inside $( … ):
+# bash 3.2 matches parentheses through a heredoc there, and SQL has open ones.
+cat > "$TMPROOT/go_ts.diff" <<'DIFF'
 --- a/x.go
 +++ b/x.go
 @@
@@ -202,7 +206,7 @@ go_ts="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat
 +export function buildDigest(rows: Row[]) {
 +export const useRadar = () => {
 DIFF
-)"
+go_ts="$("$SH" "$SCAN" --extract-symbols < "$TMPROOT/go_ts.diff" 2>/dev/null | flat)"
 echo "$go_ts" | jq -e '.added | index("ResolveWindow")' >/dev/null 2>&1 \
   && ok "Go func recognised" || bad "Go func recognised" "got: $go_ts"
 echo "$go_ts" | jq -e '.removed | index("oldHelper")' >/dev/null 2>&1 \
@@ -214,7 +218,7 @@ echo "$go_ts" | jq -e '.added | index("useRadar")' >/dev/null 2>&1 \
 
 # One definition per language, each behind the modifiers that language puts
 # in front of its names.
-many="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat
+cat > "$TMPROOT/many.diff" <<'DIFF'
 --- a/lib.rs
 +++ b/lib.rs
 @@
@@ -256,7 +260,7 @@ many="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat
 +export interface Props {
 +export default class extends Base {
 DIFF
-)"
+many="$("$SH" "$SCAN" --extract-symbols < "$TMPROOT/many.diff" 2>/dev/null | flat)"
 for want in load_config Settings build Billing fetchAll Status Invoice render Renderable \
             OrderService handle InvoiceLine main Props; do
   echo "$many" | jq -e --arg w "$want" '.added | index($w)' >/dev/null 2>&1 \
@@ -277,7 +281,7 @@ echo "$noise" | jq -e '(.added | length) == 0' >/dev/null 2>&1 \
 
 # SQL names sit behind optional keywords, and a policy name is often a
 # quoted sentence. Each of these was once misread.
-sql="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat
+cat > "$TMPROOT/sql.diff" <<'DIFF'
 --- a/schema.sql
 +++ b/schema.sql
 @@
@@ -289,7 +293,7 @@ sql="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null | flat
 +create materialized view "public"."daily stats" as
 +create index on widgets (b);
 DIFF
-)"
+sql="$("$SH" "$SCAN" --extract-symbols < "$TMPROOT/sql.diff" 2>/dev/null | flat)"
 echo "$sql" | jq -e '.added | sort == (["Big Idx", "Users can read own rows", "public.daily stats",
     "public.touch_updated_at", "widgets", "widgets_sku_idx"] | sort)' >/dev/null 2>&1 \
   && ok "SQL: if-not-exists, quoted, unique, concurrently, qualified and unnamed forms" \
@@ -297,7 +301,7 @@ echo "$sql" | jq -e '.added | sort == (["Big Idx", "Users can read own rows", "p
 
 # A function that moved to another file still exists: it must not be reported
 # as removed, or Claude is told never to call something it should call.
-moved="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null
+cat > "$TMPROOT/moved.diff" <<'DIFF'
 --- a/utils.py
 +++ b/utils.py
 @@
@@ -308,7 +312,7 @@ moved="$(cat <<'DIFF' | "$SH" "$SCAN" --extract-symbols 2>/dev/null
 @@
 +def parse_date(s):
 DIFF
-)"
+moved="$("$SH" "$SCAN" --extract-symbols < "$TMPROOT/moved.diff" 2>/dev/null)"
 echo "$moved" | jq -e '.["utils.py"].moved == [{name: "parse_date", to: "dates.py"}]
     and .["utils.py"].removed == ["really_gone"]' >/dev/null 2>&1 \
   && ok "a definition moved to another file is 'moved', not 'removed'" \

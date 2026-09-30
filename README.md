@@ -191,7 +191,7 @@ Don't do both. With the plugin and manual hooks together, every hook runs twice.
 
 ```sh
 bash tests/test.sh                              # the whole suite
-EMSK_PR_TEST_SHELL=/bin/bash bash tests/test.sh # under macOS's bash 3.2
+/bin/bash tests/test.sh                         # all of it under macOS's bash 3.2
 claude plugin validate . --strict               # the manifests
 ```
 
