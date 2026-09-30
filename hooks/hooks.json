@@ -1,0 +1,29 @@
+{
+  "description": "emsk-pr: a pull-request digest when a session starts, and a collision check before each edit",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/skills/emsk-pr/scan.sh\"",
+            "timeout": 45,
+            "statusMessage": "emsk-pr: catching up on open PRs"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/skills/emsk-pr/guard.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

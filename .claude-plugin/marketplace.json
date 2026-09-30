@@ -1,0 +1,18 @@
+{
+  "name": "emsk-pr",
+  "owner": {
+    "name": "Aya Nabil",
+    "url": "https://github.com/1AyaNabil1"
+  },
+  "metadata": {
+    "description": "emsk-pr: keep Claude Code current with the pull requests your team has open and just merged."
+  },
+  "plugins": [
+    {
+      "name": "emsk-pr",
+      "source": "./",
+      "description": "Catch what your teammates changed before you edit: a digest of open and just-merged pull requests at session start, and a warning before every edit to a file another PR is touching.",
+      "category": "productivity"
+    }
+  ]
+}

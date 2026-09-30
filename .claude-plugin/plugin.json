@@ -1,0 +1,13 @@
+{
+  "name": "emsk-pr",
+  "version": "1.0.0",
+  "description": "Catch what your teammates changed before you edit: a digest of open and just-merged pull requests at session start, and a warning before every edit to a file another PR is touching.",
+  "author": {
+    "name": "Aya Nabil",
+    "url": "https://github.com/1AyaNabil1"
+  },
+  "homepage": "https://github.com/1AyaNabil1/emsk-pr",
+  "repository": "https://github.com/1AyaNabil1/emsk-pr",
+  "license": "MIT",
+  "keywords": ["pull-requests", "github", "merge-conflicts", "team", "hooks", "code-review"]
+}
