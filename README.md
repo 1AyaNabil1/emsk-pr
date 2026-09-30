@@ -4,7 +4,6 @@
 keeps the agent current with the pull requests in flight: what is open, what just
 merged, and which of it collides with the branch you are on.
 
-*emsk* (امسك) is Egyptian Arabic for "catch".
 
 ## The problem
 
