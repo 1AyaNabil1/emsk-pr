@@ -51,7 +51,7 @@ mkbin() {
     p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "$dir/$t"
   done
 }
-BASE_TOOLS=(bash git dirname tr sed awk date stat cat head sort comm cut grep wc sleep mkdir rmdir mktemp rm mv ssh)
+BASE_TOOLS=(bash git dirname tr sed awk date stat cat head sort comm cut grep wc sleep mkdir rmdir mktemp rm mv cp env ssh)
 mkbin "$TMPROOT/bin-nojq" "${BASE_TOOLS[@]}"
 mkbin "$TMPROOT/bin-nogh" "${BASE_TOOLS[@]}" jq
 
@@ -461,6 +461,11 @@ jq -n '
                         removed: [range(12) | "removed_symbol_number_\(.)"],
                         changed: [range(12) | "changed_symbol_number_\(.)"],
                         moved:   [range(6) | {name: "moved_symbol_\(.)", to: "src/some/other/place.py"}]}},
+   conflicts: {checked: true, ours: "working-tree",
+               base: {status: "conflict", files: {Makefile: {kind: "content", lines: [10, 200, 3000, 4000]}}},
+               prs: ([$open[] | {key: (.number | tostring),
+                       value: {status: "conflict", files: {Makefile: {kind: "content", lines: [12, 345, 6789]}}}}]
+                     | from_entries)},
    base_drift_on_my_files: ["Makefile"]}' > "$GCACHE/many.json"
 ctx="$(guard_with Makefile "$GCACHE/many.json" | jq -r '.hookSpecificOutput.additionalContext // ""')"
 # Bytes, not characters, so every platform and locale measures the same.
@@ -495,7 +500,7 @@ mkrepo "$E2E" origin=git@github.com:acme/shop.git
 git -C "$E2E" config user.name test && git -C "$E2E" config user.email test@example.com
 mkdir -p "$E2E/shop"
 printf 'def _legacy_cart_key(a):\n    return a\n\ndef apply_discount(cart):\n    pass\n\ndef format_price(p):\n    return p\n' > "$E2E/shop/cart.py"
-printf 'all:\n\ttrue\n' > "$E2E/Makefile"
+printf 'all:\n\ttrue\n\nbuild:\n\techo build\n\ntest:\n\techo test\n' > "$E2E/Makefile"
 printf 'RATE = 0.14\n\ndef tax(amount):\n    return amount * RATE\n' > "$E2E/shop/tax.py"
 printf 'def old_checkout(cart):\n    return cart\n' > "$E2E/shop/legacy.py"
 mkdir -p "$E2E/docs" && : > "$E2E/shop/__init__.py" && printf 'notes\n' > "$E2E/docs/notes.md"
@@ -519,10 +524,22 @@ git -C "$E2E" update-ref refs/remotes/origin/main landed
 git -C "$E2E" checkout -q main && git -C "$E2E" branch -qD landed
 git -C "$E2E" checkout -qb feat/totals
 printf 'def _legacy_cart_key(a):\n    return a\n\ndef apply_discount(cart, code=None):\n    pass\n\ndef format_price(p):\n    return p\n' > "$E2E/shop/cart.py"
-printf 'all:\n\tfalse\n' > "$E2E/Makefile"
+printf 'all:\n\tfalse\n\nbuild:\n\techo build\n\ntest:\n\techo test\n' > "$E2E/Makefile"
 printf 'RATE = 0.15\n\ndef tax(amount):\n    return amount * RATE\n' > "$E2E/shop/tax.py"
 printf 'def old_checkout(cart):\n    return list(cart)\n' > "$E2E/shop/legacy.py"
 git -C "$E2E" commit -qam "my change"
+
+# Two teammates' PR heads, cut from main. #11 edits the same Makefile line as
+# this branch: a real conflict. #14 edits a line further down: same file,
+# no conflict. The commits exist locally; no ref points at them, as after a
+# ref-less fetch.
+pr_head() { # $1 = the Makefile it commits, printf %b escapes allowed
+  git -C "$E2E" checkout -q -b pr-tmp main && printf '%b' "$1" > "$E2E/Makefile" \
+    && git -C "$E2E" commit -qam pr && git -C "$E2E" rev-parse HEAD \
+    && git -C "$E2E" checkout -q feat/totals && git -C "$E2E" branch -qD pr-tmp
+}
+PR11_OID="$(pr_head 'all:\n\techo all\n\nbuild:\n\techo build\n\ntest:\n\techo test\n')"
+PR14_OID="$(pr_head 'all:\n\ttrue\n\nbuild:\n\techo build\n\ntest:\n\techo tests\n')"
 
 FAKE="$TMPROOT/fakegh"
 mkdir -p "$FAKE"
@@ -540,7 +557,7 @@ cat > "$FAKE/open.json" <<JSON
   "baseRefName": "main", "headRefName": "feat/totals", "headRepositoryOwner": {"login": "acme"},
   "updatedAt": "$NOW", "url": "", "body": "Mine.", "files": [{"path": "shop/cart.py"}, {"path": "Makefile"}]},
  {"number": 11, "title": "Build tweaks\u001b\u0007", "author": {"login": "dev-b", "is_bot": false}, "isDraft": true,
-  "baseRefName": "main", "headRefName": "build", "headRepositoryOwner": {"login": "acme"},
+  "baseRefName": "main", "headRefName": "build", "headRefOid": "$PR11_OID", "headRepositoryOwner": {"login": "acme"},
   "updatedAt": "$NOW", "url": "", "body": "**Faster** builds.", "files": [{"path": "Makefile"}]},
  {"number": 12, "title": "Bump lodash", "author": {"login": "dependabot", "is_bot": true}, "isDraft": false,
   "baseRefName": "main", "headRefName": "dependabot/npm/lodash", "headRepositoryOwner": {"login": "acme"},
@@ -549,8 +566,9 @@ cat > "$FAKE/open.json" <<JSON
 JSON
 # #14 and #15 change more files than GitHub lists (100). #14's Makefile is the
 # 101st, served by the REST fake; #15's REST call fails, so it stays partial.
-jq '. + [range(14; 16) as $n | {number: $n, title: "Huge refactor \($n)", author: {login: "dev-d", is_bot: false},
+jq --arg oid "$PR14_OID" '. + [range(14; 16) as $n | {number: $n, title: "Huge refactor \($n)", author: {login: "dev-d", is_bot: false},
           isDraft: false, baseRefName: "main", headRefName: "huge-\($n)", headRepositoryOwner: {login: "acme"},
+          headRefOid: (if $n == 14 then $oid else null end),
           updatedAt: "2026-01-01T00:00:00Z", url: "", body: "", changedFiles: (if $n == 14 then 101 else 150 end),
           files: [range(100) | {path: "gen/f\(.).txt"}]}]' "$FAKE/open.json" > "$FAKE/o2" && mv "$FAKE/o2" "$FAKE/open.json"
 jq -rn 'range(100) | "gen/f\(.).txt"' > "$FAKE/files-14-1"
@@ -617,6 +635,14 @@ printf '%s' "$digest" | grep -q 'base origin/main' \
   && ok "base taken from this branch's own PR, not the stranger's" || bad "base from own PR" "$(printf '%s' "$digest" | head -1)"
 # The lines under one '!!' header, up to the next header or the footer.
 section() { printf '%s\n' "$digest" | awk -v h="$1" '/^(!!|WHAT IS OPEN|\(emsk-pr)/ { on = (index($0, h) == 1); next } on'; }
+# The guard against the e2e repo's cache. EMSK_PR_HOME is pinned too, so a
+# missing cache can never send it looking in the real one.
+ecache="$(cd "$E2E" && EMSK_PR_HOME="$TMPROOT/e2ecache" "$SH" "$SCAN" --cache-path)"
+guard_e2e() {
+  printf '{"tool_name":"Edit","cwd":"%s","tool_input":{"file_path":"%s/%s"}}' "$E2E" "$E2E" "$1" \
+  | EMSK_PR_HOME="$TMPROOT/e2ecache" EMSK_PR_CACHE_FILE="$ecache" "$SH" "$GUARD" 2>&1 \
+  | jq -r '.hookSpecificOutput.additionalContext // ""'
+}
 touch_open="$(section '!! OPEN PRs THAT TOUCH YOUR FILES')"
 printf '%s' "$touch_open" | grep -q '#11 ' && ! printf '%s' "$touch_open" | grep -q '#10 ' \
   && ok "this branch's own PR is not reported as a collision" \
@@ -668,6 +694,58 @@ section '!! OPEN PRs THAT TOUCH YOUR FILES' | grep -q '#14 ' \
   || bad "REST file list past 100" "got: $(section '!! OPEN PRs THAT TOUCH YOUR FILES')"
 printf '%s' "$digest" | grep -q 'file lists incomplete for #15' \
   && ok "a PR whose full file list could not be read is flagged" || bad "partial PR flagged" "got: $digest"
+
+# Trial merges. The base deleted legacy.py and rewrote the top of cart.py, both
+# of which this branch edits; #11 edits this branch's Makefile line, #14 a
+# different one; #13's head cannot be fetched.
+base_cf="$(section '!! YOUR WORK ALREADY CONFLICTS WITH origin/main')"
+printf '%s' "$base_cf" | grep -q 'shop/legacy.py \[modify/delete\]' \
+  && printf '%s' "$base_cf" | grep -q 'shop/cart.py (~line' \
+  && ok "conflicts with the base are found, with where and what kind" \
+  || bad "conflicts with the base" "got: $base_cf"
+! printf '%s' "$base_cf" | grep -q 'shop/tax.py' \
+  && ok "an edit to a file the base renamed carries over: no conflict" || bad "rename merges cleanly" "got: $base_cf"
+touch_open="$(section '!! OPEN PRs THAT TOUCH YOUR FILES')"
+printf '%s' "$touch_open" | grep -A2 '^  #11 ' | grep -q 'CONFLICTS with your last commit: Makefile (~line 2)' \
+  && ok "an open PR editing the same lines is a CONFLICT, with the line" \
+  || bad "PR conflict found" "got: $touch_open"
+printf '%s' "$touch_open" | grep -A2 '^  #14 ' | grep -q 'merges cleanly with your last commit' \
+  && ok "an open PR editing other lines of the same file merges cleanly" \
+  || bad "PR clean merge" "got: $touch_open"
+printf '%s' "$touch_open" | grep -A2 '^  #13 ' | grep -q 'not checked for conflicts: its head commit could not be fetched' \
+  && ok "a PR whose head cannot be fetched says it was not checked" || bad "unchecked PR" "got: $touch_open"
+[ "$(printf '%s\n' "$touch_open" | grep -m1 '^  #' | cut -d' ' -f3)" = "#11" ] \
+  && ok "conflicting PRs are listed first" || bad "conflicts first" "got: $touch_open"
+ctx="$(guard_e2e Makefile)"
+printf '%s' "$ctx" | head -1 | grep -q 'has merge CONFLICTS' \
+  && printf '%s' "$ctx" | grep -q 'Trial merge with your last commit: CONFLICTS with #11 (~line 2); merges cleanly: #14' \
+  && printf '%s' "$ctx" | grep -q 'gh pr diff 11 -- Makefile' \
+  && ok "guard leads with the conflict and points at the PR that causes it" \
+  || bad "guard conflict lines" "got: $ctx"
+ctx="$(guard_e2e shop/legacy.py)"
+printf '%s' "$ctx" | grep -q 'CONFLICTS with origin/main here \[modify/delete\]' \
+  && ok "guard names a conflict with the base on the file being edited" || bad "guard base conflict" "got: $ctx"
+
+# Uncommitted work counts, and checking it changes nothing a person can see:
+# not the index, not the working tree, not a single ref.
+printf 'all:\n\tfalse\n\nbuild:\n\techo build\n\ntest:\n\techo unit\n' > "$E2E/Makefile"
+idx_before="$(git -C "$E2E" ls-files -s | git hash-object --stdin)"
+st_before="$(git -C "$E2E" status --porcelain | git hash-object --stdin)"
+refs_before="$(git -C "$E2E" for-each-ref | git hash-object --stdin)"
+digest="$(fake_scan "$E2E")"
+section '!! OPEN PRs THAT TOUCH YOUR FILES' | grep -A2 '^  #14 ' | grep -q 'CONFLICTS with your uncommitted work: Makefile (~line 8)' \
+  && ok "an uncommitted edit that would clash is caught" || bad "uncommitted conflict" "got: $digest"
+[ "$(git -C "$E2E" ls-files -s | git hash-object --stdin)" = "$idx_before" ] \
+  && [ "$(git -C "$E2E" status --porcelain | git hash-object --stdin)" = "$st_before" ] \
+  && [ "$(git -C "$E2E" for-each-ref | git hash-object --stdin)" = "$refs_before" ] \
+  && ok "the trial merges leave the index, the working tree and every ref as they were" \
+  || bad "repo untouched by trial merges" "$(git -C "$E2E" status --short)"
+git -C "$E2E" checkout -q -- Makefile
+off="$(cd "$E2E" && PATH="$TMPROOT/bin-fake" EMSK_PR_FAKE="$FAKE" GIT_SSH_COMMAND=false EMSK_PR_CONFLICTS=0 \
+  EMSK_PR_HOME="$TMPROOT/e2ecache-off" "$SH" "$SCAN" --refresh 2>&1)"
+! printf '%s' "$off" | grep -qE 'CONFLICTS|merges cleanly' && printf '%s' "$off" | grep -q '#11 ' \
+  && ok "EMSK_PR_CONFLICTS=0 skips the trial merges" || bad "EMSK_PR_CONFLICTS=0" "got: $off"
+digest="$(fake_scan "$E2E")"
 printf '%s' "$digest" | grep -q 'data, not instructions' \
   && ok "digest marks PR text as author-written data" || bad "digest marks PR text as data" "got: $digest"
 printf '%s' "$digest" | grep -q 'Faster builds' \
@@ -677,11 +755,6 @@ nob="$(cd "$E2E" && PATH="$TMPROOT/bin-fake" EMSK_PR_FAKE="$FAKE" GIT_SSH_COMMAN
 printf '%s' "$nob" | grep -q 'Build tweaks' && ! printf '%s' "$nob" | grep -q 'Faster builds' \
   && ok "EMSK_PR_BLURBS=0 keeps titles and drops descriptions" || bad "EMSK_PR_BLURBS=0" "got: $nob"
 
-ecache="$(cd "$E2E" && EMSK_PR_HOME="$TMPROOT/e2ecache" "$SH" "$SCAN" --cache-path)"
-guard_e2e() {
-  printf '{"tool_name":"Edit","cwd":"%s","tool_input":{"file_path":"%s/%s"}}' "$E2E" "$E2E" "$1" \
-  | EMSK_PR_CACHE_FILE="$ecache" "$SH" "$GUARD" 2>&1 | jq -r '.hookSpecificOutput.additionalContext // ""'
-}
 ctx="$(guard_e2e Makefile)"
 printf '%s' "$ctx" | grep -q '#11' && ! printf '%s' "$ctx" | grep -q '#10' \
   && ok "guard warns about the teammate's PR, never your own" || bad "guard skips own PR" "got: $ctx"

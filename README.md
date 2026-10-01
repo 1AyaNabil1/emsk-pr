@@ -27,10 +27,18 @@ WHAT IS OPEN (4)
          @dev-b  — Faster builds by caching the lint step.
   + 1 bot PR: #12 (dependabot)
 
+!! YOUR WORK ALREADY CONFLICTS WITH origin/main — merge it in before building on these
+     shop/legacy.py [modify/delete]
+
 !! OPEN PRs THAT TOUCH YOUR FILES — read these before you edit
   #11 Build tweaks
      shared: Makefile
+     CONFLICTS with your uncommitted work: Makefile (~line 2)
      see: gh pr diff 11 -- Makefile
+  #14 Split the checkout page
+     shared: Makefile · shop/cart.py
+     merges cleanly with your uncommitted work: same files, different lines
+     see: gh pr diff 14 -- Makefile
 
 !! LANDED ON origin/main SINCE YOUR BRANCH POINT — you do NOT have these
    1 of your files moved under you (read one: git show origin/main:<path>):
@@ -82,6 +90,14 @@ To update: `/plugin marketplace update emsk-pr`, then `/plugin update emsk-pr@em
 - **Talks up when something is missing.** In a GitHub repo without `jq` or `gh`,
   or with `gh` logged out, you get one `emsk-pr:` line saying what to install.
 - **Works offline.** The last digest is served from cache, with its age.
+- **Real conflicts, not just shared files.** For every open PR that shares a
+  file with you, and for the base branch, the merge is tried for real with
+  `git merge-tree`, against your uncommitted edits too. You get `CONFLICTS`
+  with roughly which lines, or `merges cleanly`. Your work and theirs are each
+  replayed onto the base tip first, so a PR that is merely out of date with the
+  base is not blamed on you; files where it is are marked `unsettled`. Nothing
+  in your repo changes: no ref, no index entry, no file in the working tree.
+  Needs git 2.38 or newer; with an older git, shared files are still reported.
 - **Only what you don't have.** A merged PR is reported only if it went into your
   base branch *and* its merge commit is not in your branch yet. Release merges
   into another branch, and anything you already pulled in, stay quiet.
@@ -134,6 +150,7 @@ Environment variables, for tuning:
 | `EMSK_PR_FILE_PAGES` | `40` | REST requests per scan for PRs over 100 files |
 | `EMSK_PR_SYMBOL_FILES` | `25` | Max drifted files to report definition changes for |
 | `EMSK_PR_BLURBS` | `1` | `0` leaves PR descriptions out of the digest |
+| `EMSK_PR_CONFLICTS` | `1` | `0` skips the trial merges (and fetching PR heads) |
 | `EMSK_PR_HOME` | `~/.claude/emsk-pr` | Cache directory |
 
 ## Privacy and safety
@@ -145,6 +162,10 @@ Environment variables, for tuning:
   repo, anyone who opens a PR writes part of that text.** The digest labels it as
   author-written data, but if that worries you, set `EMSK_PR_BLURBS=0` to keep
   titles and drop descriptions.
+- To try merges, it fetches the head commits of PRs that share files with you,
+  without creating a branch, a ref or a `FETCH_HEAD`, and snapshots your
+  uncommitted work through a scratch copy of git's index. What it leaves behind
+  is unreferenced objects, which `git gc` cleans up on its usual schedule.
 - Credentials embedded in a remote URL are stripped before the repo name is used
   for anything.
 - The cache is plain JSON under `~/.claude/emsk-pr/`. Delete it any time.

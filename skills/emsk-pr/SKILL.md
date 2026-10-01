@@ -42,7 +42,8 @@ or after a teammate says they merged something.
 | Section | What it means |
 |---|---|
 | `WHAT IS OPEN` | Every open PR, one line: number, draft flag, title, author, first line of the body. `(this branch)` marks the PR opened from the current branch. Bot PRs are folded into one line. This is the "keep me updated" answer — report it when asked. |
-| `OPEN PRs THAT TOUCH YOUR FILES` | Someone else is editing the same file right now. Merge pain is coming. |
+| `YOUR WORK ALREADY CONFLICTS WITH <remote>/<base>` | A trial merge of your work (uncommitted edits included) into the base tip failed in these files, with roughly which lines. |
+| `OPEN PRs THAT TOUCH YOUR FILES` | Someone else is editing the same file right now. Under each, the trial merge's verdict: `CONFLICTS with …` (your edits and theirs meet, at those lines), `merges cleanly` (same files, different lines), or `unsettled` (their PR conflicts with the base there, so their final version is not known). Conflicting PRs come first. |
 | `LANDED ON <remote>/<base> SINCE YOUR BRANCH POINT` | Files that moved under the branch. The local copy is older than the base branch. `(renamed to X …)` and `(deleted …)` mark files the base no longer has under that name. |
 | `Definitions that changed` | `+ added` / `- removed` / `> moved` / `~ changed` function, method, class, type and SQL object names. |
 | `MERGED INTO <base> AFTER YOUR BRANCH POINT` | PRs merged into the base that this branch does not have yet, and which of your files they touched. A PR already in the branch, or merged into another branch, is never listed. |
@@ -56,6 +57,12 @@ began and has no scan, the guard starts one in the background.
 
 ## Rules once it has spoken
 
+0. **A `CONFLICTS` line is real, not a guess.** git tried the merge and it failed
+   at those lines. Read the other side there first (`gh pr diff <n> -- <path>`,
+   or `git show <remote>/<base>:<path>`), then change the code so the two fit,
+   or tell the user who to coordinate with. Do not make the clash worse by
+   building more on those lines. `merges cleanly` means no textual clash today;
+   the two changes can still disagree in meaning, so it is not a sign-off.
 1. **A `- removed` symbol is not a gap to fill.** It was deleted on purpose. Do not
    redefine it, do not call it, do not "restore" it. Find what replaced it. A
    rename, or a move into a file the scanner cannot read, also shows as removed:
@@ -106,13 +113,18 @@ Per repo, as git config (add `--global` for every repo):
 | `emsk-pr.base` | Base branch. Default: what this branch's PR targets, else what most merged PRs target, else the default branch. |
 | `emsk-pr.hosts` | Extra GitHub Enterprise hostnames, space-separated. |
 
+`EMSK_PR_CONFLICTS=0` turns the trial merges off. They need git 2.38 or newer;
+with an older git, shared files are still reported, just without a verdict.
+
 ## How it fits together
 
 - `scan.sh` — lists open PRs, then the PRs merged into the base since the branch
   point, keeping only those whose merge commit is not in the branch. Fills in full
   file lists for PRs over GitHub's 100-file cap, intersects them with the branch's
   own changed files, diffs the base branch for added/removed/moved/changed
-  definitions, and writes `cache.json` + `digest.txt`.
+  definitions, trial-merges the working tree against the base and against each
+  overlapping PR with `git merge-tree` (no ref, index or file in the working
+  tree is touched), and writes `cache.json` + `digest.txt`.
 - `guard.sh` — reads the `PreToolUse` payload, looks the target file up in
   `cache.json`, returns `additionalContext`. No network of its own and never blocks
   an edit; past the TTL it starts `scan.sh --quiet` in the background.

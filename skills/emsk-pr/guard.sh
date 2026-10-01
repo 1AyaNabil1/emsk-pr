@@ -104,19 +104,46 @@ MSG="$(jq -r --arg f "$REL" --argjson age "$AGE" --argjson ttl "$TTL" '
   # Every path the base moved, so a file first edited after the scan counts too.
   ((.base_drift // .base_drift_on_my_files // []) | index($f) != null) as $drifted |
   ((.base_gone // {})[$f]) as $gone |
+  # Trial merges from the scan: against the base, and against each open PR.
+  (.conflicts // {}) as $cf |
+  (if $cf.ours == "working-tree" then "your uncommitted work" else "your last commit" end) as $ours |
+  (($cf.base // {}).files // {})[$f] as $base_conflict |
+  def where: (if (.lines | length) > 0 then " (~line \(.lines[0:3] | map(tostring) | join(", ")))" else "" end)
+             + (if .kind != "content" then " [\(.kind)]" else "" end);
+  [ $hit.open[] as $n | ($cf.prs // {})[$n | tostring] as $k | select($k != null)
+    | if ($k.files[$f] != null) then {n: $n, t: "conflict", w: ($k.files[$f] | where)}
+      elif (($k.unsettled // []) | index($f)) != null then {n: $n, t: "unsettled"}
+      elif $k.status == "clean" or $k.status == "conflict" then {n: $n, t: "clean"}
+      else empty end ] as $trials |
+  [$trials[] | select(.t == "conflict")] as $tc |
+  ($base_conflict != null or ($tc | length) > 0) as $conflicted |
+  def nums: map("#\(.n)") | some(3);
   if (($hit.open | length) == 0) and (($hit.merged | length) == 0) and ($sym == null)
      and ($drifted | not) then
     ""
   else
-    ([ "emsk-pr: \($f) is contested — other work touches this same file."
-     ]
+    ([ if $conflicted then "emsk-pr: \($f) has merge CONFLICTS with other work."
+       else "emsk-pr: \($f) is contested — other work touches this same file." end ]
+     + (if $base_conflict != null then
+          [ "  CONFLICTS with \($remote)/\(.base) here\($base_conflict | where): merge it in before building on this file." ]
+        else [] end)
+     # One line for every trial merge on this file: the first conflict gets
+     # its lines, the rest are numbers.
+     + (if ($trials | length) > 0 then
+          [ "  Trial merge with \($ours): "
+            + ([ (if ($tc | length) > 0 then "CONFLICTS with #\($tc[0].n)\($tc[0].w)"
+                    + (if ($tc | length) > 1 then ", " + ($tc[1:] | nums) else "" end) else empty end),
+                 ([$trials[] | select(.t == "clean")] | select(length > 0) | "merges cleanly: " + nums),
+                 ([$trials[] | select(.t == "unsettled")] | select(length > 0) | "unsettled: " + nums)
+               ] | join("; ")) ]
+        else [] end)
      + (if ($hit.open | length) > 0 then
           [ "  OPEN: " + ([ $hit.open[0:2][] as $n
               | (.open[] | select(.number == $n)
-                 | "#\($n) \(.title | clip(32)) (@\(who))") ] | join("; "))
+                 | "#\($n) \(.title | clip(28)) (@\(who))") ] | join("; "))
             + (if ($hit.open | length) > 2
                then " (+\(($hit.open | length) - 2) more)" else "" end)
-          , "  Read it before editing: gh pr diff \($r)\($hit.open[0]) -- \($f)" ]
+          , "  Read it before editing: gh pr diff \($r)\(([$trials[] | select(.t == "conflict") | .n] + $hit.open)[0]) -- \($f)" ]
         else [] end)
      # Merged PRs are numbers only: the symbol lines below already say what
      # changed, so a title here would cost more context than it buys.
@@ -129,7 +156,7 @@ MSG="$(jq -r --arg f "$REL" --argjson age "$AGE" --argjson ttl "$TTL" '
           [ "  \($gone | sub("^renamed"; "Renamed")) on \($remote)/\(.base) since you branched: edit that file, not this one." ]
         elif $gone != null then
           [ "  Deleted on \($remote)/\(.base) since you branched: check why before bringing it back." ]
-        elif $drifted then
+        elif $drifted and $base_conflict == null then
           [ "  Changed on \($remote)/\(.base) since you branched; your copy is older: git show \($remote)/\(.base):\($f)" ]
         else [] end)
      # Removed names get the most room: re-adding one is the failure this
@@ -144,7 +171,8 @@ MSG="$(jq -r --arg f "$REL" --argjson age "$AGE" --argjson ttl "$TTL" '
                   + "  <- still exist, use them there" ] else [] end)
            + (if ($sym.added | length) > 0 then
                 [ "  NEW on \(.base): " + ($sym.added | some(3)) + "  <- use these" ] else [] end)
-           + (if ($sym.changed | length) > 0 then
+           # with a real conflict to report, this is the line that gives way
+           + (if ($sym.changed | length) > 0 and ($conflicted | not) then
                 [ "  CHANGED on \(.base): " + ($sym.changed | some(3)) ] else [] end))
         else [] end)
      + (if $age >= $ttl then

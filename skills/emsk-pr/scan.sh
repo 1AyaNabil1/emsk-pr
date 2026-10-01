@@ -28,6 +28,7 @@ MERGED_LIMIT="${EMSK_PR_MERGED_LIMIT:-100}"  # merges into the base since the br
 FILE_PAGES="${EMSK_PR_FILE_PAGES:-40}"  # REST requests per scan for PRs over 100 files
 SYMBOL_FILES="${EMSK_PR_SYMBOL_FILES:-25}"  # cap on files we report definitions for
 BLURBS="${EMSK_PR_BLURBS:-1}"       # 0 leaves PR descriptions out of the digest
+CONFLICTS="${EMSK_PR_CONFLICTS:-1}" # 0 skips the trial merges against open PRs and the base
 
 # A hook has no terminal to answer a prompt on, so a credential or passphrase
 # prompt would only stall the session until the timeout.
@@ -246,6 +247,14 @@ pick_remote() {
   return 1
 }
 
+git_at_least() { # $1 = major, $2 = minor
+  local v maj rest min
+  v="$(git --version 2>/dev/null | awk '{ print $3 }')"
+  maj="${v%%.*}"; rest="${v#*.}"; min="${rest%%.*}"
+  case "$maj$min" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$maj" -gt "$1" ] || { [ "$maj" -eq "$1" ] && [ "$min" -ge "$2" ]; }
+}
+
 fmt_epoch() { # $1 = epoch seconds, $2 = date format; BSD date first, then GNU
   date -u -r "$1" "$2" 2>/dev/null || date -u -d "@$1" "$2" 2>/dev/null
 }
@@ -364,6 +373,10 @@ if [ "$MODE" = "doctor" ]; then
   elif [ -f "$CACHE" ]; then doc "ok" "base branch $(jq -r '.base // "?"' "$CACHE" 2>/dev/null) (detected at the last scan)"
   else doc "ok" "base branch: detected on the first scan"
   fi
+  if [ "$CONFLICTS" = 0 ]; then doc "--" "conflict check off (EMSK_PR_CONFLICTS=0)"
+  elif git_at_least 2 38; then doc "ok" "conflict check on (git merge-tree)"
+  else doc "--" "conflict check off: it needs git 2.38 or newer; shared files are still reported"
+  fi
   if [ -f "$CACHE" ]; then doc "ok" "cache $CACHE ($(human_age "$(cache_age)"))"
   else doc "--" "no cache yet: run bash \"$HERE/scan.sh\" --refresh"
   fi
@@ -381,7 +394,7 @@ CFG_BASE="$(git -C "$ROOT" config --get emsk-pr.base 2>/dev/null)"
 # Open PRs, and, when the base branch has to be guessed, which branches recent
 # merges went into. Both at once: this runs while a session is starting.
 run_timeout 15 gh pr list --repo "$GH_REPO" --state open --limit "$OPEN_LIMIT" \
-  --json number,title,author,isDraft,baseRefName,headRefName,headRepositoryOwner,updatedAt,url,body,files,changedFiles \
+  --json number,title,author,isDraft,baseRefName,headRefName,headRefOid,headRepositoryOwner,updatedAt,url,body,files,changedFiles \
   > "$TMP/open.json" 2> "$TMP/open.err" &
 open_pid=$!
 echo '[]' > "$TMP/bases.json"
@@ -604,6 +617,147 @@ for f in "$TMP"/files-*.txt; do
     "$TMP/big.json" > "$TMP/big2.json" && mv "$TMP/big2.json" "$TMP/big.json"
 done
 
+# --------------------------------------------------------------- conflicts ---
+# Sharing a file is not colliding in it. For each open PR that shares a file
+# with this branch, and for the base when it moved under one of my files, the
+# merge is tried for real. Nothing a person sees in the repo changes: `git
+# merge-tree` writes no ref, index or working-tree file, PR heads are fetched
+# without a ref or FETCH_HEAD, and uncommitted work is snapshotted through a
+# scratch copy of the index. What is left is unreferenced objects for gc.
+
+# A commit of the working tree as it is now, uncommitted edits included, plus
+# any untracked file that another branch also has. Prints "<oid> <what>".
+worktree_commit() {
+  local head idx tree oid
+  head="$(git -C "$ROOT" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" || return 1
+  if git -C "$ROOT" diff --quiet HEAD 2>/dev/null && [ ! -s "$TMP/untracked_overlap" ]; then
+    echo "$head last-commit"; return 0
+  fi
+  idx="$(git -C "$ROOT" rev-parse --git-path index 2>/dev/null)"
+  case "$idx" in /*) ;; *) idx="$ROOT/$idx" ;; esac
+  if cp "$idx" "$TMP/index" 2>/dev/null &&
+     run_timeout 10 env GIT_INDEX_FILE="$TMP/index" git -C "$ROOT" add -u >/dev/null 2>&1 &&
+     { [ ! -s "$TMP/untracked_overlap" ] ||
+       env GIT_INDEX_FILE="$TMP/index" GIT_LITERAL_PATHSPECS=1 git -C "$ROOT" add \
+         --pathspec-from-file="$TMP/untracked_overlap" >/dev/null 2>&1; } &&
+     tree="$(env GIT_INDEX_FILE="$TMP/index" git -C "$ROOT" write-tree 2>/dev/null)" &&
+     oid="$(env GIT_AUTHOR_NAME=emsk-pr GIT_AUTHOR_EMAIL=emsk-pr@localhost \
+                GIT_COMMITTER_NAME=emsk-pr GIT_COMMITTER_EMAIL=emsk-pr@localhost \
+            git -C "$ROOT" commit-tree "$tree" -p "$head" -m "emsk-pr: working tree" 2>/dev/null)"; then
+    echo "$oid working-tree"; return 0
+  fi
+  # mid-merge with unresolved files, a locked index, ...: the last commit will do
+  echo "$head last-commit"
+}
+
+# Merge two commits in memory. Leaves the result tree in MT_TREE, conflicted
+# paths in $TMP/mt_names and the CONFLICT messages in $TMP/mt_msgs.
+# Returns 0 if clean, 1 on conflicts, 2 if the merge could not be tried.
+mt() {
+  local out rc
+  out="$(run_timeout 15 git -C "$ROOT" -c core.quotePath=false merge-tree --write-tree --name-only "$1" "$2" 2>/dev/null)"
+  rc=$?
+  MT_TREE="${out%%$'\n'*}"
+  # names until the first blank line, then messages saying what kind each is
+  printf '%s\n' "$out" | awk 'NR == 1 { next } /^$/ { exit } { print }' > "$TMP/mt_names"
+  printf '%s\n' "$out" | awk 'f && /^CONFLICT \(/ { print } /^$/ { f = 1 }' > "$TMP/mt_msgs"
+  case "$rc" in 0|1) return "$rc" ;; *) return 2 ;; esac
+}
+
+# The conflicts of the last mt(), minus the paths listed in the files given, as
+# a JSON object {path: {kind, lines}}. lines are where the conflict markers sit
+# in the merged file: roughly where the two sides' edits clash.
+describe() {
+  local path lines kind
+  cat "$@" /dev/null 2>/dev/null | sort -u > "$TMP/mt_skip"
+  sort -u "$TMP/mt_names" | comm -23 - "$TMP/mt_skip" | while IFS= read -r path; do
+    lines="$(git -C "$ROOT" cat-file -p "$MT_TREE:$path" 2>/dev/null \
+             | awk '/^<<<<<<< / { printf "%s%d", (n++ ? "," : ""), NR }')"
+    kind="$(grep -F -- "$path" "$TMP/mt_msgs" | head -1 | sed 's/^CONFLICT (\([^)]*\)).*/\1/')"
+    printf '%s\t%s\t%s\n' "$path" "${kind:-content}" "$lines"
+  done | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")
+      | {key: .[0], value: {kind: .[1], lines: ((.[2] // "") | split(",") | map(select(length > 0) | tonumber))}})
+    | from_entries'
+}
+
+# $1's work replayed onto the base tip, as a commit whose only parent is the
+# tip; its oid goes in ON_BASE. Two such commits merge with the tip as their
+# common ancestor, so only the two sides' own edits can meet: the base's
+# history cancels out. The replay's own conflicts, its quarrel with the base,
+# are copied to $2 and stay in mt()'s state for describe.
+on_base() {
+  ON_BASE=""
+  mt "$BASE_OID" "$1"
+  [ $? = 2 ] && return 1
+  cp "$TMP/mt_names" "$2"
+  ON_BASE="$(env GIT_AUTHOR_NAME=emsk-pr GIT_AUTHOR_EMAIL=emsk-pr@localhost \
+                 GIT_COMMITTER_NAME=emsk-pr GIT_COMMITTER_EMAIL=emsk-pr@localhost \
+             git -C "$ROOT" commit-tree "$MT_TREE" -p "$BASE_OID" -m "emsk-pr: replay" 2>/dev/null)"
+  [ -n "$ON_BASE" ]
+}
+
+echo '{}' > "$TMP/conflicts.json"
+if [ "$CONFLICTS" != 0 ] && git_at_least 2 38; then
+  # Open PRs, not mine, that share a file with me, and every file they touch.
+  jq -r --arg b "$BRANCH" --arg me "$HEAD_OWNER" --rawfile mine "$TMP/mine.txt" \
+     --slurpfile big "$TMP/big.json" "$OWN"'
+    ($mine | split("\n") | map(select(length > 0) | {key: ., value: true}) | from_entries) as $set
+    | .[] | select(own($b; $me) | not)
+    | (($big[0][.number | tostring]) // (.files // [] | map(.path))) as $f
+    | select([$f[] | select($set[.])] | length > 0)
+    | "\(.number) \(.headRefOid // "-")"' "$TMP/open.json" > "$TMP/check_prs" 2>/dev/null
+  jq -r --arg b "$BRANCH" --arg me "$HEAD_OWNER" --slurpfile big "$TMP/big.json" "$OWN"'
+    .[] | select(own($b; $me) | not) | (($big[0][.number | tostring]) // (.files // [] | map(.path)))[]' \
+    "$TMP/open.json" 2>/dev/null | cat - "$TMP/drift.txt" | sort -u > "$TMP/other_files"
+  git -C "$ROOT" ls-files --others --exclude-standard 2>/dev/null | sort -u \
+    | comm -12 - "$TMP/other_files" > "$TMP/untracked_overlap"
+
+  if [ -s "$TMP/check_prs" ] || [ -s "$TMP/drift_mine.txt" ]; then
+    # Heads not here yet are fetched in one go, into no ref at all.
+    refs=()
+    while read -r n oid; do
+      git -C "$ROOT" cat-file -e "$oid^{commit}" 2>/dev/null || refs+=("refs/pull/$n/head")
+    done < "$TMP/check_prs"
+    [ ${#refs[@]} -gt 0 ] && run_timeout 20 git -C "$ROOT" fetch --quiet --no-tags \
+      --no-write-fetch-head "$REMOTE_NAME" "${refs[@]}" >/dev/null 2>&1
+
+    read -r OURS OURS_KIND <<< "$(worktree_commit)"
+    BASE_OID="$(git -C "$ROOT" rev-parse -q --verify "$BASE_REF^{commit}" 2>/dev/null)"
+    # My work on the base tip. Its conflicts are my conflicts with the base.
+    if [ -n "${OURS:-}" ] && [ -n "$BASE_OID" ] && on_base "$OURS" "$TMP/mine_vs_base"; then
+      MINE_ON_BASE="$ON_BASE"
+      {
+        printf '{"checked": true, "ours": "%s", "base": ' "$OURS_KIND"
+        if [ -s "$TMP/mine_vs_base" ]; then printf '{"status": "conflict", "files": %s}' "$(describe)"
+        else printf '{"status": "clean", "files": {}}'; fi
+        printf ', "prs": {'
+        sep=""
+        while read -r n oid; do
+          printf '%s"%s": ' "$sep" "$n"; sep=", "
+          if ! git -C "$ROOT" cat-file -e "$oid^{commit}" 2>/dev/null; then
+            printf '{"status": "unchecked", "files": {}}'; continue
+          fi
+          if ! on_base "$oid" "$TMP/theirs_vs_base"; then
+            printf '{"status": "error", "files": {}}'; continue
+          fi
+          mt "$MINE_ON_BASE" "$ON_BASE"; rc=$?
+          # Where either side already fails against the base, a clash between
+          # us cannot be told from that failure. Such files are left out of
+          # the conflicts, and the ones I touch are named as unsettled.
+          unsettled="$(sort -u "$TMP/theirs_vs_base" | comm -12 - "$TMP/mine.txt" \
+                       | jq -R -s 'split("\n") | map(select(length > 0))')"
+          if [ "$rc" = 2 ]; then printf '{"status": "error", "files": {}}'; continue; fi
+          files="$(describe "$TMP/mine_vs_base" "$TMP/theirs_vs_base")"
+          jq -n -c --argjson f "$files" --argjson u "$unsettled" \
+            '{status: (if ($f | length) > 0 then "conflict" else "clean" end), files: $f, unsettled: $u}'
+        done < "$TMP/check_prs"
+        printf '}}\n'
+      } > "$TMP/conflicts.json"
+      jq -e 'type == "object"' "$TMP/conflicts.json" >/dev/null 2>&1 || echo '{}' > "$TMP/conflicts.json"
+    fi
+  fi
+fi
+
 MINE_JSON="$(jq -R -s 'split("\n") | map(select(length > 0))' < "$TMP/mine.txt")"
 DRIFT_JSON="$(jq -R -s 'split("\n") | map(select(length > 0))' < "$TMP/drift_mine.txt")"
 # Every path that moved on the base, not only the ones this branch touched at
@@ -629,6 +783,7 @@ jq -n \
   --slurpfile big "$TMP/big.json" \
   --slurpfile drift_all "$TMP/drift_all.json" \
   --slurpfile gone "$TMP/gone.json" \
+  --slurpfile conflicts "$TMP/conflicts.json" \
   --slurpfile symbols "$TMP/symbols.json" "$OWN"'
   ($mine | map({key: ., value: true}) | from_entries) as $mineset |
   # Full file lists where the 100-file cap was hit or a rename hid an old path,
@@ -662,6 +817,7 @@ jq -n \
     base_drift_on_my_files: $drift,
     base_drift: $drift_all[0],
     base_gone: $gone[0],
+    conflicts: $conflicts[0],
     open: $o,
     merged: $m,
     symbols: $symbols[0],
@@ -685,6 +841,14 @@ mv -f "$TMP/cache.json" "$CACHE.$$.tmp" && mv -f "$CACHE.$$.tmp" "$CACHE" || exi
 # ----------------------------------------------------------------- digest ---
 # A PR can share dozens of files with the branch; the first few say enough.
 SHARED='def shared: if length > 4 then (.[0:4] | join(" · ")) + " (+\(length - 4) more)" else join(" · ") end; '
+# Conflicting files from merge_check, each with where it clashes and how.
+# shellcheck disable=SC2016  # jq source
+CONF='def ours: if .ours == "working-tree" then "your uncommitted work" else "your last commit" end;
+  def cfile: .key + (if (.value.lines | length) > 0
+                     then " (~line \(.value.lines[0:3] | map(tostring) | join(", ")))" else "" end)
+                  + (if .value.kind != "content" then " [\(.value.kind)]" else "" end);
+  def cfiles: to_entries | map(cfile)
+              | if length > 3 then (.[0:3] | join(" · ")) + " (+\(length - 3) more)" else join(" · ") end; '
 {
   printf '=== emsk-pr: %s · branch %s · base %s/%s ===\n' "$PR_SLUG" "$BRANCH" "$REMOTE_NAME" "$BASE"
 
@@ -706,10 +870,31 @@ SHARED='def shared: if length > 4 then (.[0:4] | join(" · ")) + " (+\(length - 
   jq -r '[.open[], .merged[] | select(.partial and (.own | not))] | select(length > 0) |
     "  (file lists incomplete for \(map("#\(.number)") | join(" ")): a collision in them can be missed)"' "$CACHE"
 
+  if jq -e '.conflicts.base.status == "conflict"' "$CACHE" >/dev/null 2>&1; then
+    printf '\n!! YOUR WORK ALREADY CONFLICTS WITH %s/%s — merge it in before building on these\n' "$REMOTE_NAME" "$BASE"
+    jq -r "$CONF"'.conflicts.base.files | to_entries | (.[0:10][] | "     \(cfile)"),
+      (if length > 10 then "     (+\(length - 10) more)" else empty end)' "$CACHE"
+  fi
+
   if jq -e '[.open[] | select(.overlap | length > 0)] | length > 0' "$CACHE" >/dev/null; then
     printf '\n!! OPEN PRs THAT TOUCH YOUR FILES — read these before you edit\n'
-    jq -r "$SHARED"'.gh_repo_flag as $r | .open[] | select(.overlap | length > 0) |
-      "  #\(.number) \(.title)\n     shared: \(.overlap | shared)\n     see: gh pr diff \($r)\(.number) -- \(.overlap[0])"' "$CACHE"
+    # A trial merge decided each one: conflicts first, then those that merge
+    # cleanly, which share files but not lines.
+    jq -r "$SHARED$CONF"'.gh_repo_flag as $r | (.conflicts.prs // {}) as $c
+      | ((.conflicts // {}) | ours) as $ours
+      | [.open[] | select(.overlap | length > 0)]
+      | sort_by(if $c[.number | tostring].status == "conflict" then 0 else 1 end) | .[] |
+      "  #\(.number) \(.title)\n     shared: \(.overlap | shared)"
+      + ($c[.number | tostring] as $k
+         | if $k == null then ""
+           elif $k.status == "conflict" then "\n     CONFLICTS with \($ours): \($k.files | cfiles)"
+           elif $k.status == "clean" then "\n     merges cleanly with \($ours): same files, different lines"
+           elif $k.status == "unchecked" then "\n     (not checked for conflicts: its head commit could not be fetched)"
+           else "\n     (not checked for conflicts: git merge-tree failed)" end)
+      + ($c[.number | tostring].unsettled // [] | if length > 0 then
+           "\n     unsettled: it conflicts with the base itself in \(shared), so their final version is not known yet"
+         else "" end)
+      + "\n     see: gh pr diff \($r)\(.number) -- \(.overlap[0])"' "$CACHE"
   fi
 
   if jq -e '.base_drift_on_my_files | length > 0' "$CACHE" >/dev/null; then

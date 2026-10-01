@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.0 — 2026-10-01
+
+Real conflicts, not just shared files.
+
+- For each open PR that shares a file with the branch, and for the base when it
+  moved under the branch, the merge is tried with `git merge-tree`, against
+  uncommitted edits too. The digest says `CONFLICTS` (with roughly which lines
+  and what kind, such as modify/delete) or `merges cleanly`, and lists
+  conflicting PRs first. The guard leads with the conflict for the file being
+  edited and points at the PR that causes it.
+- Both sides are replayed onto the base tip before they are compared, so a PR
+  that is merely behind the base is not reported as conflicting with you. Files
+  where that PR conflicts with the base are marked `unsettled` instead.
+- Nothing visible changes in the repo: PR heads are fetched without a ref or
+  `FETCH_HEAD`, the working tree is snapshotted through a scratch index, and
+  `merge-tree` writes nothing but objects.
+- Needs git 2.38 or newer; `--doctor` says whether it is on. `EMSK_PR_CONFLICTS=0`
+  turns it off.
+
 ## 1.2.0 — 2026-10-01
 
 From an audit of 1.1.0.

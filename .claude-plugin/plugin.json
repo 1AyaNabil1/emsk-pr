@@ -1,6 +1,6 @@
 {
   "name": "emsk-pr",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Catch what your teammates changed before you edit: a digest of open and just-merged pull requests at session start, and a warning before every edit to a file another PR is touching.",
   "author": {
     "name": "Aya Nabil",
