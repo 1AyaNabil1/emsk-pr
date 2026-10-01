@@ -29,11 +29,37 @@ if [ -z "$ROOT" ]; then
 fi
 [ -n "$ROOT" ] || exit 0
 
+# GNU first: GNU `stat -f` means file-system status, which prints a report and
+# then fails, so a BSD-first chain would read that report as a number.
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+
+# Run scan.sh --quiet in the background and return at once: the edit is never
+# delayed, and the next one sees the new scan. One at a time and at most once a
+# minute, so a burst of edits, or a run of edits while offline, does not become
+# a burst of scans.
+start_refresh() {
+  local dir="${CACHE%/*}" lock stamp
+  mkdir -p "$dir" 2>/dev/null || return 0
+  lock="$dir/refresh.lock"; stamp="$dir/refresh.last"
+  [ -f "$stamp" ] && [ $(( $(date +%s) - $(mtime "$stamp") )) -lt 60 ] && return 0
+  if [ -d "$lock" ] && [ $(( $(date +%s) - $(mtime "$lock") )) -gt 120 ]; then
+    rmdir "$lock" 2>/dev/null   # a refresh that died without cleaning up
+  fi
+  mkdir "$lock" 2>/dev/null || return 0
+  : > "$stamp"
+  # Every descriptor redirected, or the hook's caller would wait on the pipe.
+  ( cd "$ROOT" && bash "$HERE/scan.sh" --quiet; rmdir "$lock" ) </dev/null >/dev/null 2>&1 &
+}
+
 CACHE="${EMSK_PR_CACHE_FILE:-}"
 if [ -z "$CACHE" ]; then
   CACHE="$(cd "$ROOT" 2>/dev/null && bash "$HERE/scan.sh" --cache-path 2>/dev/null)" || exit 0
+  [ -n "$CACHE" ] || exit 0
+  # No scan for this branch yet: it was checked out after the session began.
+  # Say nothing this time, and have a scan ready for the next edit.
+  [ -f "$CACHE" ] || { start_refresh; exit 0; }
 fi
-[ -n "$CACHE" ] && [ -f "$CACHE" ] || exit 0
+[ -f "$CACHE" ] || exit 0
 jq -e . "$CACHE" >/dev/null 2>&1 || exit 0
 
 # Path as the cache stores it: relative to the repo root. git reports the root
@@ -55,24 +81,10 @@ esac
 [ -n "$REL" ] || exit 0
 
 # The scan runs at session start, so a long session edits against an old one.
-# Past the TTL, start a refresh in the background and answer from what is here:
-# this edit is never delayed, and the next one sees the new scan. A lock keeps a
-# burst of edits from starting a burst of refreshes.
+# Past the TTL, answer from what is here and refresh for next time.
 TTL="${EMSK_PR_TTL:-1800}"
-# GNU first: GNU `stat -f` means file-system status, which prints a report and
-# then fails, so a BSD-first chain would read that report as a number.
-mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 AGE=$(( $(date +%s) - $(mtime "$CACHE") ))
-if [ "$AGE" -ge "$TTL" ]; then
-  LOCK="${CACHE%/*}/refresh.lock"
-  if [ -d "$LOCK" ] && [ $(( $(date +%s) - $(mtime "$LOCK") )) -gt 120 ]; then
-    rmdir "$LOCK" 2>/dev/null   # a refresh that died without cleaning up
-  fi
-  if mkdir "$LOCK" 2>/dev/null; then
-    # Every descriptor redirected, or the hook's caller would wait on the pipe.
-    ( cd "$ROOT" && bash "$HERE/scan.sh" --quiet; rmdir "$LOCK" ) </dev/null >/dev/null 2>&1 &
-  fi
-fi
+[ "$AGE" -ge "$TTL" ] && start_refresh
 
 MSG="$(jq -r --arg f "$REL" --argjson age "$AGE" --argjson ttl "$TTL" '
   # gh returns author as an object; tolerate a bare string so a malformed cache
@@ -89,8 +101,11 @@ MSG="$(jq -r --arg f "$REL" --argjson age "$AGE" --argjson ttl "$TTL" '
   (.gh_repo_flag // "") as $r |
   (.by_file[$f] // {open: [], merged: []}) as $hit |
   (.symbols[$f] // null) as $sym |
-  ((.base_drift_on_my_files // []) | index($f) != null) as $drifted |
-  if (($hit.open | length) == 0) and (($hit.merged | length) == 0) and ($sym == null) then
+  # Every path the base moved, so a file first edited after the scan counts too.
+  ((.base_drift // .base_drift_on_my_files // []) | index($f) != null) as $drifted |
+  ((.base_gone // {})[$f]) as $gone |
+  if (($hit.open | length) == 0) and (($hit.merged | length) == 0) and ($sym == null)
+     and ($drifted | not) then
     ""
   else
     ([ "emsk-pr: \($f) is contested — other work touches this same file."
@@ -110,7 +125,11 @@ MSG="$(jq -r --arg f "$REL" --argjson age "$AGE" --argjson ttl "$TTL" '
             + ($hit.merged | map("#\(.)") | some(3))
             + "  (gh pr view \($r)<n>)" ]
         else [] end)
-     + (if $drifted then
+     + (if $gone != null and ($gone | startswith("renamed")) then
+          [ "  \($gone | sub("^renamed"; "Renamed")) on \($remote)/\(.base) since you branched: edit that file, not this one." ]
+        elif $gone != null then
+          [ "  Deleted on \($remote)/\(.base) since you branched: check why before bringing it back." ]
+        elif $drifted then
           [ "  Changed on \($remote)/\(.base) since you branched; your copy is older: git show \($remote)/\(.base):\($f)" ]
         else [] end)
      # Removed names get the most room: re-adding one is the failure this

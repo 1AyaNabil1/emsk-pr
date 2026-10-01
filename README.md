@@ -70,7 +70,8 @@ Restart the session. You need:
 
 - [`gh`](https://cli.github.com), logged in: `gh auth login`
 - [`jq`](https://jqlang.org/download/)
-- `git` and `bash` (macOS, Linux, or Windows with Git Bash)
+- `git` and `bash` on macOS or Linux, both tested in CI. Windows with Git Bash
+  may work but has not been tested.
 
 To update: `/plugin marketplace update emsk-pr`, then `/plugin update emsk-pr@emsk-pr`.
 
@@ -89,8 +90,11 @@ To update: `/plugin marketplace update emsk-pr`, then `/plugin update emsk-pr@em
   When it can't be had, the digest says which PRs are incomplete.
 - **Moves aren't deletions.** A function that moved to another file is reported
   as `> moved`, with where it went, not as removed.
+- **Catches renamed and deleted files.** Editing a file the base renamed or
+  deleted gets a warning saying which, and where it went.
 - **Stays fresh.** In a long session, an edit against a scan older than 30
-  minutes starts a new scan in the background. The edit is never delayed.
+  minutes starts a new scan in the background, and so does the first edit on a
+  branch checked out mid-session. The edit is never delayed.
 - **Cheap.** A refresh takes a few seconds and is cached for 30 minutes. The edit
   guard itself never waits on the network.
 - **Understands forks.** If you have an `upstream` remote, PRs are read from there,

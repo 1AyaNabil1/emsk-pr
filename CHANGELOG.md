@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.2.0 — 2026-10-01
+
+From an audit of 1.1.0.
+
+- Your own PR, once squash-merged, no longer counts as a collision when you keep
+  working on the branch.
+- A file the base renamed or deleted is now caught. Plain `git diff --name-only`
+  and `gh pr list` only name a rename's new path, so editing the old one was
+  silent. The digest and the guard now say "renamed to …" or "deleted". An empty
+  file that git pairs as a rename (every empty `__init__.py` looks the same) is
+  reported as deleted.
+- The guard warns on any file the base changed, not only the ones the branch had
+  touched when the scan ran.
+- The first edit on a branch checked out mid-session starts that branch's scan
+  in the background; the guard used to stay silent until the next session.
+  Background scans run at most once a minute.
+- A failed refresh says why, using gh's own error (bad credentials, rate limit,
+  timeout, a gh too old for a field), and labels the digest it falls back to.
+- Cache and digest are written by renaming into place, so a parallel scan or
+  the guard never reads half a file.
+- Cache layout is now `<owner>/<repo>/<branch>` with `%`-encoded branch names, so
+  `feat/x` and `feat-x` no longer share a cache. Old `<owner-repo>` directories
+  under `~/.claude/emsk-pr/` are unused and safe to delete.
+- Methods with the same name in unrelated classes (`run`, `Close`) are no longer
+  reported as moved, and `__init__`-style names are ignored.
+- `const total = (price * qty)` is no longer taken for an arrow function.
+- Control characters in PR titles and descriptions are stripped; full PR
+  descriptions are no longer kept in the cache (a quarter of its size).
+- The digest's drifted-file list says how many it left out past 20.
+- README: Windows is marked untested.
+
 ## 1.1.0 — 2026-09-30
 
 Fewer false alarms and fewer missed ones.

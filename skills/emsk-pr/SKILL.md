@@ -43,14 +43,16 @@ or after a teammate says they merged something.
 |---|---|
 | `WHAT IS OPEN` | Every open PR, one line: number, draft flag, title, author, first line of the body. `(this branch)` marks the PR opened from the current branch. Bot PRs are folded into one line. This is the "keep me updated" answer — report it when asked. |
 | `OPEN PRs THAT TOUCH YOUR FILES` | Someone else is editing the same file right now. Merge pain is coming. |
-| `LANDED ON <remote>/<base> SINCE YOUR BRANCH POINT` | Files that moved under the branch. The local copy is older than the base branch. |
+| `LANDED ON <remote>/<base> SINCE YOUR BRANCH POINT` | Files that moved under the branch. The local copy is older than the base branch. `(renamed to X …)` and `(deleted …)` mark files the base no longer has under that name. |
 | `Definitions that changed` | `+ added` / `- removed` / `> moved` / `~ changed` function, method, class, type and SQL object names. |
 | `MERGED INTO <base> AFTER YOUR BRANCH POINT` | PRs merged into the base that this branch does not have yet, and which of your files they touched. A PR already in the branch, or merged into another branch, is never listed. |
 | `(file lists incomplete for #…)` | GitHub would not give the full file list of those PRs, so a collision in them can go unreported. |
 
 The edit guard repeats the relevant part as a short warning right before an edit
-to a contested file. It never blocks the edit. When the scan is older than 30
-minutes, the guard says so and starts a fresh scan in the background.
+to a contested file, including any file the base changed, renamed or deleted,
+whether or not the branch had touched it yet. It never blocks the edit. When the
+scan is older than 30 minutes, or the branch was checked out after the session
+began and has no scan, the guard starts one in the background.
 
 ## Rules once it has spoken
 
@@ -67,6 +69,9 @@ minutes, the guard says so and starts a fresh scan in the background.
    Names alone are not enough to know whether an edit conflicts in intent.
 5. **The local copy of a drifted file is stale.** Read it from the base branch
    (`git show <remote>/<base>:<path>`, as printed) before assuming what is in it.
+   If the base **renamed** it, make the change in the new file. If the base
+   **deleted** it, find out why (`git log <remote>/<base> -- <path>`) before
+   editing it back into existence.
 6. **Report the open-PR list when asked what is going on.** That is the whole point
    of the section; do not summarise it away to one sentence.
 
@@ -88,7 +93,8 @@ a one-line `emsk-pr:` hint instead. For anything else, run `scan.sh --doctor` �
 it walks every check and says which one failed.
 
 Offline, the last cached digest is served with its age. Cache lives in
-`~/.claude/emsk-pr/<owner-repo>/<branch>/`; delete that directory to reset.
+`~/.claude/emsk-pr/<owner>/<repo>/<branch>/` (slashes in the branch written as
+`%2F`); delete that directory to reset.
 
 ## Settings
 

@@ -7,7 +7,7 @@
 #   scan.sh --quiet            refresh, print nothing
 #   scan.sh --doctor           say why a digest is, or is not, being produced
 #   scan.sh --cache-path       print where this repo+branch caches (no network)
-#   scan.sh --extract-symbols  read a unified diff on stdin, print {added,removed,changed}
+#   scan.sh --extract-symbols  read a unified diff on stdin, print {file: {added,removed,changed,moved}}
 #
 # Outside a GitHub repo it prints NOTHING and exits 0: it runs as a hook in
 # every project, so silence is the contract. Inside one, a missing tool gets a
@@ -47,8 +47,10 @@ esac
 
 # ---------------------------------------------------------------- symbols ---
 # Pull function/method/class/type/SQL-object names out of a unified diff, one
-# row per definition line: side <TAB> file <TAB> name. The file comes from the
-# `--- a/…` / `+++ b/…` headers, so a diff must use git's default a/ b/ prefixes.
+# row per definition line: side <TAB> file <TAB> name <TAB> top, where top is 1
+# for a definition at the top level of its file and 0 for a method. The file
+# comes from the `--- a/…` / `+++ b/…` headers, so a diff must use git's
+# default a/ b/ prefixes.
 symbol_rows() {
   awk '
     /^--- (a\/|\/dev\/null)/   { mf = ($0 ~ /^--- \/dev\/null/)   ? "" : substr($0, 7); next }
@@ -58,15 +60,19 @@ symbol_rows() {
       if (side != "+" && side != "-") next
       if ($0 ~ /^(\+\+\+|---)/) next
       body = substr($0, 2)
+      top = (body !~ /^[ \t]/)
       sub(/^[ \t]+/, "", body)
       # comment lines are not definitions, however much they look like one
       if (body ~ /^(#|\/\/|\*|\/\*|--)/) next
 
       name = ""
       low = tolower(body)
-      if (body ~ /=[ \t]*(async[ \t]*)?(\(|[A-Za-z_$][A-Za-z0-9_$]*[ \t]*=>)/ &&
+      # JS/TS arrow functions: export const useThing = (...) =>. The arrow is on
+      # the line, or the line ends opening the parameter list; without one of
+      # those, `const total = (price * qty)` would count as a function.
+      if (body ~ /=[ \t]*(async[ \t]*)?(<[^>]*>[ \t]*)?(\(|[A-Za-z_$][A-Za-z0-9_$]*[ \t]*=>)/ &&
+          (body ~ /=>/ || body ~ /\([ \t]*\{?[ \t]*$/) &&
           match(body, /^(export[ \t]+)?(const|let|var)[ \t]+[A-Za-z_$][A-Za-z0-9_$]*/)) {
-        # JS/TS arrow functions: export const useThing = (...) =>
         name = substr(body, RSTART, RLENGTH)
         sub(/^(export[ \t]+)?(const|let|var)[ \t]+/, "", name)
       } else if (match(low, /^create[ \t]+(or[ \t]+replace[ \t]+)?((temp|temporary|unlogged|materialized|unique|recursive|constraint|global|local)[ \t]+)*(function|procedure|view|table|policy|trigger|index|type|sequence|schema|domain|extension)[ \t]+(concurrently[ \t]+)?(if[ \t]+not[ \t]+exists[ \t]+)?/)) {
@@ -88,7 +94,9 @@ symbol_rows() {
         if (match(decl, /^(def|fn|fun|func|function|class|struct|enum|trait|interface|protocol|module|object|type|record)[ \t]+/)) {
           kw = substr(decl, 1, RLENGTH); sub(/[ \t]+$/, "", kw)
           rest = substr(decl, RLENGTH + 1)
-          if (kw == "func") sub(/^\([^)]*\)[ \t]*/, "", rest)        # Go method receiver
+          if (kw == "func" && rest ~ /^\(/) {                        # Go method receiver
+            sub(/^\([^)]*\)[ \t]*/, "", rest); top = 0
+          }
           if (kw == "def")  sub(/^self\./, "", rest)                 # Ruby class method
           if (kw == "enum") sub(/^class[ \t]+/, "", rest)            # Kotlin enum class
           if (kw == "fun") {                                         # Kotlin generics, receiver
@@ -99,31 +107,37 @@ symbol_rows() {
           if (name == "extends" || name == "implements") name = ""
         }
       }
-      if (name != "") print side "\t" (side == "+" ? pf : mf) "\t" name
+      # __init__ and friends are in every class; they say nothing on their own
+      if (name ~ /^__.*__$/) name = ""
+      if (name != "") print side "\t" (side == "+" ? pf : mf) "\t" name "\t" (top ? 1 : 0)
     }
   '
 }
 
 # Sort each file's names into added (plus side only), removed (minus side only)
 # and changed (both sides: the signature or body moved, it did not vanish).
-# A name removed from one file but added to another in the same diff is moved,
-# not removed: it still exists, and calling it from its new home is right.
+# A top-level name removed from one file but added at the top level of another
+# is moved, not removed: it still exists, and calling it from its new home is
+# right. Methods are not paired this way: `run` or `new` in two unrelated
+# classes is a coincidence, not a move.
 extract_symbols() {
   symbol_rows | jq -R -s '
-    split("\n") | map(select(length > 0) | split("\t") | {s: .[0], f: .[1], n: .[2]}) as $rows
-    | ($rows | map(select(.s == "+")) | group_by(.n)
+    split("\n") | map(select(length > 0) | split("\t") | {s: .[0], f: .[1], n: .[2], t: .[3]}) as $rows
+    | ($rows | map(select(.s == "+" and .t == "1")) | group_by(.n)
        | map({key: .[0].n, value: (map(.f) | unique)}) | from_entries) as $added_in
     | $rows | group_by(.f) | map(
         .[0].f as $f
         | (map(select(.s == "+") | .n) | unique) as $p
         | (map(select(.s == "-") | .n) | unique) as $m
+        | (map(select(.s == "-" and .t == "1") | .n) | unique) as $mtop
         | ($m - $p) as $gone
+        | [ $gone[] | . as $x | select($mtop | any(. == $x))
+            | (($added_in[$x] // []) - [$f]) | select(length > 0) | {name: $x, to: .[0]} ] as $moved
         | {key: $f, value: {
             added:   ($p - $m),
             changed: [ $p[] | select(. as $x | $m | any(. == $x)) ],
-            removed: [ $gone[] | select((($added_in[.] // []) - [$f]) | length == 0) ],
-            moved:   [ $gone[] | . as $x | (($added_in[$x] // []) - [$f])
-                       | select(length > 0) | {name: $x, to: .[0]} ] }})
+            removed: ($gone - [ $moved[].name ]),
+            moved:   $moved }})
     | from_entries
     | with_entries(select((.value.added + .value.removed + .value.changed + .value.moved) | length > 0))'
 }
@@ -265,11 +279,17 @@ serve_digest() {
     "$(human_age "$(cache_age)")" "$HERE"
 }
 
-# gh cannot be used right now: serve the last digest if there is one, and say
-# why there is none if there is not.
-fallback() {
+# No fresh scan is possible: serve the last digest if there is one, and either
+# way say why. A stale digest with no reason looks like a current one.
+fallback() { # $1 = why, as a short clause
   case "$MODE" in
-    auto|refresh) if [ -s "$DIGEST" ]; then serve_digest; else hint "$1"; fi ;;
+    auto|refresh)
+      if [ -s "$DIGEST" ]; then
+        printf 'emsk-pr: could not refresh the PR digest: %s. Showing the last one.\n' "$1"
+        serve_digest
+      else
+        hint "no PR digest for $PR_SLUG: $1"
+      fi ;;
   esac
   exit 0
 }
@@ -296,10 +316,15 @@ if ! pick_remote; then
 fi
 doc "ok" "pull requests from remote '$REMOTE_NAME' -> $PR_HOST/$PR_SLUG"
 
-SAFE_SLUG="$(printf '%s' "$PR_SLUG" | tr '/' '-')"
-[ "$PR_HOST" = "github.com" ] || SAFE_SLUG="$PR_HOST-$SAFE_SLUG"
-SAFE_BRANCH="$(printf '%s' "$BRANCH" | tr '/' '-')"
-CACHE_DIR="$EMSK_PR_HOME/$SAFE_SLUG/$SAFE_BRANCH"
+# One directory per [host/]owner/repo/branch. Owners and repos cannot contain
+# a slash, and a GitHub owner cannot contain a dot, so an Enterprise host's
+# directory never meets an owner's. The branch is %-encoded rather than having
+# its slashes flattened, so feat/x and feat-x never share a cache.
+SAFE_BRANCH="${BRANCH//[%]/%25}"
+SAFE_BRANCH="${SAFE_BRANCH//\//%2F}"
+if [ "$PR_HOST" = "github.com" ]; then CACHE_DIR="$EMSK_PR_HOME/$PR_SLUG/$SAFE_BRANCH"
+else CACHE_DIR="$EMSK_PR_HOME/$PR_HOST/$PR_SLUG/$SAFE_BRANCH"
+fi
 CACHE="$CACHE_DIR/cache.json"
 DIGEST="$CACHE_DIR/digest.txt"
 
@@ -319,13 +344,13 @@ fi
 
 if ! command -v gh >/dev/null 2>&1; then
   doc "no" "the GitHub CLI (gh) is not installed: https://cli.github.com"
-  fallback "the GitHub CLI (gh) is not installed, so there is no PR digest for $PR_SLUG. Install it from https://cli.github.com"
+  fallback "the GitHub CLI (gh) is not installed (https://cli.github.com)"
 fi
 # `gh auth token` only reads local config, so a logged-out gh is caught without
 # a network round trip. Doctor pays for the real check.
 if ! gh auth token --hostname "$PR_HOST" >/dev/null 2>&1; then
   doc "no" "gh is not logged in to $PR_HOST: run gh auth login --hostname $PR_HOST"
-  fallback "gh is not logged in to $PR_HOST, so there is no PR digest. Run: gh auth login --hostname $PR_HOST"
+  fallback "gh is not logged in to $PR_HOST (run: gh auth login --hostname $PR_HOST)"
 fi
 
 if [ "$MODE" = "doctor" ]; then
@@ -348,7 +373,7 @@ fi
 # ---------------------------------------------------------------- refresh ---
 mkdir -p "$CACHE_DIR" 2>/dev/null || exit 0
 TMP="$(mktemp -d)" || exit 0
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP" "$CACHE.$$.tmp" "$DIGEST.$$.tmp"' EXIT
 
 GH_REPO="$PR_HOST/$PR_SLUG"
 CFG_BASE="$(git -C "$ROOT" config --get emsk-pr.base 2>/dev/null)"
@@ -357,7 +382,7 @@ CFG_BASE="$(git -C "$ROOT" config --get emsk-pr.base 2>/dev/null)"
 # merges went into. Both at once: this runs while a session is starting.
 run_timeout 15 gh pr list --repo "$GH_REPO" --state open --limit "$OPEN_LIMIT" \
   --json number,title,author,isDraft,baseRefName,headRefName,headRepositoryOwner,updatedAt,url,body,files,changedFiles \
-  > "$TMP/open.json" 2>/dev/null &
+  > "$TMP/open.json" 2> "$TMP/open.err" &
 open_pid=$!
 echo '[]' > "$TMP/bases.json"
 bases_pid=""
@@ -366,13 +391,18 @@ if [ -z "$CFG_BASE" ]; then
     > "$TMP/bases.json" 2>/dev/null &
   bases_pid=$!
 fi
-wait "$open_pid" 2>/dev/null
+wait "$open_pid" 2>/dev/null; open_rc=$?
 [ -n "$bases_pid" ] && wait "$bases_pid" 2>/dev/null
 
-# No open list means GitHub was not reached. Keep the last good cache rather
-# than overwrite it with an empty one.
-jq -e 'type == "array"' "$TMP/open.json" >/dev/null 2>&1 \
-  || fallback "could not reach $PR_HOST to list pull requests (offline, or the gh token expired)"
+# No open list means no scan. Keep the last good cache rather than overwrite it
+# with an empty one, and pass on gh's own reason: offline, an expired token, a
+# rate limit and a gh too old for these JSON fields all fail here.
+if ! jq -e 'type == "array"' "$TMP/open.json" >/dev/null 2>&1; then
+  if [ "$open_rc" = 124 ]; then why="$PR_HOST did not answer within 15s"
+  else why="$(grep -v '^[[:space:]]*$' "$TMP/open.err" 2>/dev/null | head -1 | tr -cd '[:print:]' | cut -c1-160)"
+  fi
+  fallback "gh pr list failed: ${why:-no error message}"
+fi
 jq -e 'type == "array"' "$TMP/bases.json" >/dev/null 2>&1 || echo '[]' > "$TMP/bases.json"
 
 # The branch's own PR is the one whose head lives where this branch is pushed.
@@ -397,8 +427,10 @@ BASE="$CFG_BASE"
   [.[] | select(own($b; $me)) | .baseRefName] | first // empty' "$TMP/open.json")"
 [ -n "$BASE" ] || BASE="$(jq -r \
   '[.[].baseRefName] | group_by(.) | max_by(length) | .[0] // empty' "$TMP/bases.json")"
-[ -n "$BASE" ] || BASE="$(git -C "$ROOT" symbolic-ref --short -q "refs/remotes/$REMOTE_NAME/HEAD" 2>/dev/null \
-                        | sed "s#^$REMOTE_NAME/##")"
+if [ -z "$BASE" ]; then
+  BASE="$(git -C "$ROOT" symbolic-ref --short -q "refs/remotes/$REMOTE_NAME/HEAD" 2>/dev/null)"
+  BASE="${BASE#"$REMOTE_NAME"/}"
+fi
 [ -n "$BASE" ] || BASE="$(run_timeout 6 gh repo view "$GH_REPO" --json defaultBranchRef \
   -q .defaultBranchRef.name 2>/dev/null)"
 [ -n "$BASE" ] || BASE="main"
@@ -429,13 +461,17 @@ fetch_files() { # $1 = PR number, $2 = its changedFiles
   PAGES_LEFT=$((PAGES_LEFT - pages))
   while [ "$p" -le "$pages" ]; do
     run_timeout 8 gh api --hostname "$PR_HOST" "repos/$PR_SLUG/pulls/$n/files?per_page=100&page=$p" \
-      --jq '.[].filename' > "$TMP/page-$n-$p" 2>/dev/null &
+      --jq '.[] | .filename, (.previous_filename // empty)' > "$TMP/page-$n-$p" 2>/dev/null &
     p=$((p + 1))
   done
 }
-while read -r n total; do fetch_files "$n" "$total"; done < <(jq -r --arg b "$BRANCH" --arg me "$HEAD_OWNER" "$OWN"'
-  .[] | select(own($b; $me) | not) | select((.changedFiles // 0) > (.files // [] | length))
-      | "\(.number) \(.changedFiles)"' "$TMP/open.json")
+# The REST list is also the only place a rename's old path appears: `gh pr list`
+# names the new path alone, and the old one is the path a branch would edit.
+# shellcheck disable=SC2016  # jq source
+NEEDS_FILES='def needs_files: ((.changedFiles // 0) > (.files // [] | length))
+                              or any(.files[]?; .changeType == "RENAMED"); '
+while read -r n total; do fetch_files "$n" "$total"; done < <(jq -r --arg b "$BRANCH" --arg me "$HEAD_OWNER" "$OWN$NEEDS_FILES"'
+  .[] | select(own($b; $me) | not) | select(needs_files) | "\(.number) \(.changedFiles)"' "$TMP/open.json")
 
 # Merges into the base since the branch point, found from the base ref already
 # here so the search can run alongside the fetch. A stale ref can only put the
@@ -452,7 +488,7 @@ fi
 [ -n "$fetched" ] || { fetch_base & fetch_pid=$!; }
 run_timeout 15 gh pr list --repo "$GH_REPO" --state merged --base "$BASE" \
   ${SINCE[@]+"${SINCE[@]}"} --limit "$MERGED_LIMIT" \
-  --json number,title,author,baseRefName,mergedAt,mergeCommit,url,files,changedFiles \
+  --json number,title,author,baseRefName,headRefName,headRepositoryOwner,mergedAt,mergeCommit,url,files,changedFiles \
   > "$TMP/merged.json" 2>/dev/null
 [ -n "$fetched" ] || wait "$fetch_pid" 2>/dev/null
 jq -e 'type == "array"' "$TMP/merged.json" >/dev/null 2>&1 || echo '[]' > "$TMP/merged.json"
@@ -474,26 +510,35 @@ jq -r '.[] | "\(.number) \(.mergeCommit.oid // "-")"' "$TMP/merged.json" | while
 done
 HAVE_JSON="$(jq -R -s 'split("\n") | map(select(length > 0) | {key: ., value: true}) | from_entries' < "$TMP/have.txt")"
 UNKNOWN_JSON="$(jq -R -s 'split("\n") | map(select(length > 0) | {key: ., value: true}) | from_entries' < "$TMP/unknown.txt")"
-jq --arg base "$BASE" --arg mbtime "$MB_TIME" --argjson have "$HAVE_JSON" --argjson unknown "$UNKNOWN_JSON" '
+# This branch's own PR, once squash-merged, is not an ancestor of the branch
+# either; but carrying on after a merge is not colliding with yourself.
+jq --arg base "$BASE" --arg mbtime "$MB_TIME" --argjson have "$HAVE_JSON" --argjson unknown "$UNKNOWN_JSON" \
+   --arg b "$BRANCH" --arg me "$HEAD_OWNER" "$OWN"'
   map(select(.baseRefName == $base)
+      | select(own($b; $me) | not)
       | select($have[.number | tostring] | not)
       | select(($unknown[.number | tostring] | not) or .mergedAt >= $mbtime))' \
   "$TMP/merged.json" > "$TMP/merged_new.json"
 MERGED_CAPPED="$(jq 'length' "$TMP/merged.json")"
 [ "$MERGED_CAPPED" -ge "$MERGED_LIMIT" ] && MERGED_CAPPED=true || MERGED_CAPPED=false
 
-# A big merged PR's commit is local by now, so its files come from git for
-# free. The count must match GitHub's: a rebase-merge's commit holds only the
-# PR's last commit, and then the REST API has to answer instead.
+# Paths out of `git diff --name-status`: both sides of a rename or copy, since
+# the old path is the one a branch cut earlier still edits.
+status_paths() { awk -F'\t' '{ print $2; if (NF > 2) print $3 }'; }
+
+# A merged PR's commit is local by now, so a big one's files, and a renamed
+# file's old path, come from git for free. The count must match GitHub's: a
+# rebase-merge's commit holds only the PR's last commit, and then the REST API
+# has to answer instead.
 while read -r n oid total; do
   if [ "$oid" != "-" ] && git -C "$ROOT" cat-file -e "$oid^{commit}" 2>/dev/null &&
-     git -C "$ROOT" diff --name-only "$oid^1" "$oid" > "$TMP/local-$n" 2>/dev/null &&
+     git -C "$ROOT" diff --name-status -M "$oid^1" "$oid" > "$TMP/local-$n" 2>/dev/null &&
      [ "$(wc -l < "$TMP/local-$n" | tr -d ' ')" -eq "$total" ]; then
-    mv "$TMP/local-$n" "$TMP/files-$n.txt"
+    status_paths < "$TMP/local-$n" > "$TMP/files-$n.txt"
   else
     fetch_files "$n" "$total"
   fi
-done < <(jq -r '.[] | select((.changedFiles // 0) > (.files // [] | length))
+done < <(jq -r "$NEEDS_FILES"'.[] | select(needs_files)
                 | "\(.number) \(.mergeCommit.oid // "-") \(.changedFiles)"' "$TMP/merged_new.json")
 
 # My files: committed since the branch point, plus staged, unstaged and new.
@@ -504,11 +549,26 @@ done < <(jq -r '.[] | select((.changedFiles // 0) > (.files // [] | length))
   git -C "$ROOT" ls-files --others --exclude-standard 2>/dev/null
 } | sed '/^$/d' | sort -u > "$TMP/mine.txt"
 
-# What landed on the base branch that this branch does not have yet.
-: > "$TMP/drift.txt"
+# What landed on the base branch that this branch does not have yet, with a
+# note for each path that no longer exists there: editing a file the base has
+# renamed or deleted is the collision that hurts most.
+: > "$TMP/drift.txt"; echo '{}' > "$TMP/gone.json"
 if [ -n "$MB" ]; then
-  git -C "$ROOT" diff --name-only "$MB" "$BASE_REF" 2>/dev/null \
-    | sed '/^$/d' | sort -u > "$TMP/drift.txt"
+  git -C "$ROOT" diff --name-status -M "$MB" "$BASE_REF" > "$TMP/drift.status" 2>/dev/null
+  status_paths < "$TMP/drift.status" | sed '/^$/d' | sort -u > "$TMP/drift.txt"
+  # git pairs identical files as renames, and every empty __init__.py is
+  # identical to every other one: an empty file "renamed" was simply deleted.
+  awk -F'\t' -v mb="$MB" '$1 ~ /^R/ { print mb ":" $2 }' "$TMP/drift.status" \
+    | git -C "$ROOT" cat-file --batch-check='%(objectsize)' > "$TMP/rename_sizes" 2>/dev/null
+  jq -R -s --rawfile sizes "$TMP/rename_sizes" '
+    split("\n") | map(select(length > 0) | split("\t")) as $rows
+    | ($sizes | split("\n")) as $sz
+    | [ $rows[] | select(.[0] | startswith("R")) ] as $ren
+    | ([ range($ren | length) as $i
+         | {key: $ren[$i][1], value: (if $sz[$i] == "0" then "deleted" else "renamed to \($ren[$i][2])" end)} ]
+       + [ $rows[] | select(.[0] == "D") | {key: .[1], value: "deleted"} ])
+    | from_entries' < "$TMP/drift.status" > "$TMP/gone.json" 2>/dev/null \
+    || echo '{}' > "$TMP/gone.json"
 fi
 comm -12 "$TMP/mine.txt" "$TMP/drift.txt" > "$TMP/drift_mine.txt"
 
@@ -546,6 +606,9 @@ done
 
 MINE_JSON="$(jq -R -s 'split("\n") | map(select(length > 0))' < "$TMP/mine.txt")"
 DRIFT_JSON="$(jq -R -s 'split("\n") | map(select(length > 0))' < "$TMP/drift_mine.txt")"
+# Every path that moved on the base, not only the ones this branch touched at
+# scan time: the guard also warns for a file first edited after the scan.
+head -n 5000 "$TMP/drift.txt" | jq -R -s 'split("\n") | map(select(length > 0))' > "$TMP/drift_all.json"
 
 # With more than one remote, or on GitHub Enterprise, a bare `gh pr diff 12`
 # asks which repo you mean. The hints in the digest carry the repo explicitly.
@@ -564,24 +627,32 @@ jq -n \
   --slurpfile open "$TMP/open.json" \
   --slurpfile merged "$TMP/merged_new.json" \
   --slurpfile big "$TMP/big.json" \
+  --slurpfile drift_all "$TMP/drift_all.json" \
+  --slurpfile gone "$TMP/gone.json" \
   --slurpfile symbols "$TMP/symbols.json" "$OWN"'
   ($mine | map({key: ., value: true}) | from_entries) as $mineset |
-  # Full file lists where the 100-file cap was hit and the REST call came back;
-  # anything still short is flagged, so a quiet guard is not read as all-clear.
+  # Full file lists where the 100-file cap was hit or a rename hid an old path,
+  # and the REST call came back. Anything still short is flagged, so a quiet
+  # guard is not read as all-clear.
   def files: ($big[0][.number | tostring] // (.files // [] | map(.path)));
-  def partial: (.changedFiles // 0) > (files | length);
+  def partial: ((.changedFiles // 0) > (files | length))
+               or ($big[0][.number | tostring] == null and any(.files[]?; .changeType == "RENAMED"));
+  # PR text goes to a terminal and into context; control characters belong in neither.
+  def clean: gsub("[[:cntrl:]]"; "");
   ($open[0] | map(
-     . + {files: files, partial: partial,
+     . + {files: files, partial: partial, title: (.title | clean),
           # The PR opened from this very branch shares every file with it; it
           # is not somebody else colliding with you.
           own: own($branch; $me),
           blurb: ((.body // "") | split("\n") | map(select(test("\\S")))
                   | map(select(test("^[#>`|<-]") | not)) | first // ""
-                  | gsub("\\*\\*|`|__"; "") | gsub("\\s+"; " ")
+                  | gsub("\\*\\*|`|__"; "") | gsub("\\s+"; " ") | clean
                   | if length > 120 then (.[0:120] | sub("\\s\\S*$"; "")) + "…" else . end)}
+     # the description is only needed for its first line
+     | del(.body)
    ) | map(. + {overlap: (if .own then [] else .files | map(select($mineset[.])) end)})) as $o |
   ($merged[0]
-   | map(. + {files: files, partial: partial})
+   | map(. + {files: files, partial: partial, title: (.title | clean)})
    | map(. + {overlap: (.files | map(select($mineset[.])))})) as $m |
   {
     generated_at: $generated, repo: $repo, host: $host, remote: $remote,
@@ -589,6 +660,8 @@ jq -n \
     merge_base: $mb, merged_capped: $capped,
     my_files: $mine,
     base_drift_on_my_files: $drift,
+    base_drift: $drift_all[0],
+    base_gone: $gone[0],
     open: $o,
     merged: $m,
     symbols: $symbols[0],
@@ -604,7 +677,10 @@ jq -n \
   }' > "$TMP/cache.json" 2>/dev/null || exit 0
 
 jq -e . "$TMP/cache.json" >/dev/null 2>&1 || exit 0
-mv "$TMP/cache.json" "$CACHE"
+# Both files are renamed into place from the same directory, so a reader never
+# sees half of one: the guard reads the cache on every edit, and two scans can
+# overlap. A move out of $TMP could cross filesystems and become a copy.
+mv -f "$TMP/cache.json" "$CACHE.$$.tmp" && mv -f "$CACHE.$$.tmp" "$CACHE" || exit 0
 
 # ----------------------------------------------------------------- digest ---
 # A PR can share dozens of files with the branch; the first few say enough.
@@ -640,7 +716,12 @@ SHARED='def shared: if length > 4 then (.[0:4] | join(" · ")) + " (+\(length - 
     printf '\n!! LANDED ON %s/%s SINCE YOUR BRANCH POINT — you do NOT have these\n' "$REMOTE_NAME" "$BASE"
     printf '   %s of your files moved under you (read one: git show %s/%s:<path>):\n' \
       "$(jq -r '.base_drift_on_my_files | length' "$CACHE")" "$REMOTE_NAME" "$BASE"
-    jq -r '.base_drift_on_my_files[] | "     \(.)"' "$CACHE" | head -20
+    jq -r '(.base_gone // {}) as $gone | .base_drift_on_my_files as $d
+      | ($d[0:20][] | "     \(.)"
+          + (if $gone[.] == null then ""
+             elif ($gone[.] | startswith("renamed")) then "  (\($gone[.]) on the base: edit that, not this)"
+             else "  (deleted on the base)" end)),
+        (if ($d | length) > 20 then "     (+\(($d | length) - 20) more)" else empty end)' "$CACHE"
     if jq -e '.symbols | length > 0' "$CACHE" >/dev/null; then
       printf '\n   Definitions that changed in those files:\n'
       jq -r '.symbols | to_entries[] |
@@ -659,7 +740,8 @@ SHARED='def shared: if length > 4 then (.[0:4] | join(" · ")) + " (+\(length - 
     jq -r 'select(.merged_capped) |
       "  (only the newest merges were read; the file list above under LANDED ON is complete)"' "$CACHE"
   fi
-} > "$DIGEST" 2>/dev/null
+} > "$DIGEST.$$.tmp" 2>/dev/null
+mv -f "$DIGEST.$$.tmp" "$DIGEST"
 
 [ "$MODE" = "quiet" ] || serve_digest
 exit 0

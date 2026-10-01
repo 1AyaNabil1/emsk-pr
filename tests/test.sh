@@ -113,31 +113,31 @@ echo
 echo "== which remote, which repo (no network: --cache-path only) =="
 
 p="$(cache_path "$TMPROOT/gh")"
-case "$p" in */acme-shop/*) ok "https remote -> acme/shop" ;; *) bad "https remote -> acme/shop" "got: $p" ;; esac
+case "$p" in */acme/shop/*) ok "https remote -> acme/shop" ;; *) bad "https remote -> acme/shop" "got: $p" ;; esac
 
 mkrepo "$TMPROOT/scp" origin=git@github.com:acme/shop.git
 p="$(cache_path "$TMPROOT/scp")"
-case "$p" in */acme-shop/*) ok "scp-style ssh remote -> acme/shop" ;; *) bad "scp-style ssh remote" "got: $p" ;; esac
+case "$p" in */acme/shop/*) ok "scp-style ssh remote -> acme/shop" ;; *) bad "scp-style ssh remote" "got: $p" ;; esac
 
 mkrepo "$TMPROOT/sshurl" origin=ssh://git@ssh.github.com:443/acme/shop
 p="$(cache_path "$TMPROOT/sshurl")"
-case "$p" in */acme-shop/*) ok "ssh:// remote on ssh.github.com:443 -> acme/shop" ;; *) bad "ssh:// remote with port" "got: $p" ;; esac
+case "$p" in */acme/shop/*) ok "ssh:// remote on ssh.github.com:443 -> acme/shop" ;; *) bad "ssh:// remote with port" "got: $p" ;; esac
 
 mkrepo "$TMPROOT/token" origin=https://x-access-token:ghs_SECRET123@github.com/acme/shop.git
 p="$(cache_path "$TMPROOT/token")"
 case "$p" in
   *SECRET*|*x-access-token*) bad "credentials in the remote never reach the cache path" "got: $p" ;;
-  */acme-shop/*)             ok "credentials in the remote never reach the cache path" ;;
+  */acme/shop/*)             ok "credentials in the remote never reach the cache path" ;;
   *)                         bad "token remote -> acme/shop" "got: $p" ;;
 esac
 
 mkrepo "$TMPROOT/fork" origin=https://github.com/me/shop.git upstream=https://github.com/acme/shop.git
 p="$(cache_path "$TMPROOT/fork")"
-case "$p" in */acme-shop/*) ok "fork: PRs are read from upstream, not origin" ;; *) bad "fork reads upstream" "got: $p" ;; esac
+case "$p" in */acme/shop/*) ok "fork: PRs are read from upstream, not origin" ;; *) bad "fork reads upstream" "got: $p" ;; esac
 
 git -C "$TMPROOT/fork" config emsk-pr.remote origin
 p="$(cache_path "$TMPROOT/fork")"
-case "$p" in */me-shop/*) ok "git config emsk-pr.remote overrides the choice" ;; *) bad "emsk-pr.remote override" "got: $p" ;; esac
+case "$p" in */me/shop/*) ok "git config emsk-pr.remote overrides the choice" ;; *) bad "emsk-pr.remote override" "got: $p" ;; esac
 
 mkrepo "$TMPROOT/ghe" origin=https://github.acme-corp.com/team/shop.git
 p="$(cache_path "$TMPROOT/ghe")"
@@ -145,8 +145,17 @@ p="$(cache_path "$TMPROOT/ghe")"
   || bad "unknown Enterprise host: silent" "got: $p"
 git -C "$TMPROOT/ghe" config emsk-pr.hosts "github.acme-corp.com"
 p="$(cache_path "$TMPROOT/ghe")"
-case "$p" in */github.acme-corp.com-team-shop/*) ok "git config emsk-pr.hosts enables an Enterprise host" ;;
+case "$p" in */github.acme-corp.com/team/shop/*) ok "git config emsk-pr.hosts enables an Enterprise host" ;;
   *) bad "emsk-pr.hosts enables an Enterprise host" "got: $p" ;; esac
+
+# Branch names that flatten to the same string must not share a cache, or one
+# branch is warned with the other's files.
+git -C "$TMPROOT/gh" checkout -q -b feat/x 2>/dev/null
+p1="$(cache_path "$TMPROOT/gh")"
+git -C "$TMPROOT/gh" checkout -q -b feat-x 2>/dev/null
+p2="$(cache_path "$TMPROOT/gh")"
+[ -n "$p1" ] && [ "$p1" != "$p2" ] && ok "feat/x and feat-x get separate caches" \
+  || bad "feat/x and feat-x get separate caches" "$p1 vs $p2"
 
 echo
 echo "== symbol extraction (the 'which method changed' engine) =="
@@ -318,6 +327,52 @@ echo "$moved" | jq -e '.["utils.py"].moved == [{name: "parse_date", to: "dates.p
   && ok "a definition moved to another file is 'moved', not 'removed'" \
   || bad "moved definitions" "got: $moved"
 
+# Methods are not paired across files: two unrelated classes each having `run`
+# is not a move, and __init__ says nothing at all. Same for Go receivers.
+cat > "$TMPROOT/methods.diff" <<'DIFF'
+--- a/a.py
++++ b/a.py
+@@
+-class Old:
+-    def __init__(self):
+-    def run(self):
+--- a/b.py
++++ b/b.py
+@@
++class New:
++    def __init__(self):
++    def run(self):
+--- a/s.go
++++ b/s.go
+@@
+-func (s *Store) Close() error {
+--- a/t.go
++++ b/t.go
+@@
++func (c *Conn) Close() error {
+DIFF
+meth="$("$SH" "$SCAN" --extract-symbols < "$TMPROOT/methods.diff" 2>/dev/null)"
+echo "$meth" | jq -e '.["a.py"].moved == [] and .["a.py"].removed == ["Old", "run"]
+    and .["s.go"].moved == [] and .["s.go"].removed == ["Close"]
+    and ([.[][] | .[] | strings | select(startswith("__"))] | length == 0)' >/dev/null 2>&1 \
+  && ok "same-named methods in unrelated classes are not 'moved'; __init__ is ignored" \
+  || bad "methods are not paired across files" "got: $meth"
+
+# A parenthesised value is not an arrow function; a multi-line parameter list is.
+cat > "$TMPROOT/arrow.diff" <<'DIFF'
+--- a/x.ts
++++ b/x.ts
+@@
++const total = (price * qty)
++export const Card = ({
++const load = async (id: string): Promise<void> => {
++const pick = <T,>(xs: T[]) => xs[0]
+DIFF
+arrow="$("$SH" "$SCAN" --extract-symbols < "$TMPROOT/arrow.diff" 2>/dev/null | flat)"
+echo "$arrow" | jq -e '.added == ["Card", "load", "pick"]' >/dev/null 2>&1 \
+  && ok "arrow functions found; const total = (price * qty) is not one" \
+  || bad "arrow-function detection" "got: $arrow"
+
 echo
 echo "== guard: the before-every-edit check =="
 
@@ -441,19 +496,32 @@ git -C "$E2E" config user.name test && git -C "$E2E" config user.email test@exam
 mkdir -p "$E2E/shop"
 printf 'def _legacy_cart_key(a):\n    return a\n\ndef apply_discount(cart):\n    pass\n\ndef format_price(p):\n    return p\n' > "$E2E/shop/cart.py"
 printf 'all:\n\ttrue\n' > "$E2E/Makefile"
+printf 'RATE = 0.14\n\ndef tax(amount):\n    return amount * RATE\n' > "$E2E/shop/tax.py"
+printf 'def old_checkout(cart):\n    return cart\n' > "$E2E/shop/legacy.py"
+mkdir -p "$E2E/docs" && : > "$E2E/shop/__init__.py" && printf 'notes\n' > "$E2E/docs/notes.md"
 git -C "$E2E" add -A && git -C "$E2E" commit -qm base
 git -C "$E2E" branch -M main
 BASE_OID="$(git -C "$E2E" rev-parse HEAD)"
+# PR #9: drops a key, adds a function, moves format_price out, renames
+# tax.py and deletes legacy.py, both of which the branch also edits.
 git -C "$E2E" checkout -qb landed
 printf 'def apply_discount(cart):\n    pass\n\ndef compute_totals(cart):\n    return cart\n' > "$E2E/shop/cart.py"
 printf 'def format_price(p):\n    return p\n' > "$E2E/shop/money.py"
+git -C "$E2E" mv shop/tax.py shop/taxes.py && git -C "$E2E" rm -q shop/legacy.py
 git -C "$E2E" add -A && git -C "$E2E" commit -qm "drop the legacy key, move format_price"
 LANDED_OID="$(git -C "$E2E" rev-parse HEAD)"
+# Then a direct push, through no PR: notes change, and an empty __init__.py
+# goes while another appears, which git reports as a rename.
+mkdir -p "$E2E/pkg" && : > "$E2E/pkg/__init__.py" && git -C "$E2E" rm -q shop/__init__.py
+printf 'notes, edited\n' > "$E2E/docs/notes.md"
+git -C "$E2E" add -A && git -C "$E2E" commit -qm "direct push"
 git -C "$E2E" update-ref refs/remotes/origin/main landed
 git -C "$E2E" checkout -q main && git -C "$E2E" branch -qD landed
 git -C "$E2E" checkout -qb feat/totals
 printf 'def _legacy_cart_key(a):\n    return a\n\ndef apply_discount(cart, code=None):\n    pass\n\ndef format_price(p):\n    return p\n' > "$E2E/shop/cart.py"
 printf 'all:\n\tfalse\n' > "$E2E/Makefile"
+printf 'RATE = 0.15\n\ndef tax(amount):\n    return amount * RATE\n' > "$E2E/shop/tax.py"
+printf 'def old_checkout(cart):\n    return list(cart)\n' > "$E2E/shop/legacy.py"
 git -C "$E2E" commit -qam "my change"
 
 FAKE="$TMPROOT/fakegh"
@@ -471,7 +539,7 @@ cat > "$FAKE/open.json" <<JSON
  {"number": 10, "title": "Totals rework", "author": {"login": "me", "is_bot": false}, "isDraft": false,
   "baseRefName": "main", "headRefName": "feat/totals", "headRepositoryOwner": {"login": "acme"},
   "updatedAt": "$NOW", "url": "", "body": "Mine.", "files": [{"path": "shop/cart.py"}, {"path": "Makefile"}]},
- {"number": 11, "title": "Build tweaks", "author": {"login": "dev-b", "is_bot": false}, "isDraft": true,
+ {"number": 11, "title": "Build tweaks\u001b\u0007", "author": {"login": "dev-b", "is_bot": false}, "isDraft": true,
   "baseRefName": "main", "headRefName": "build", "headRepositoryOwner": {"login": "acme"},
   "updatedAt": "$NOW", "url": "", "body": "**Faster** builds.", "files": [{"path": "Makefile"}]},
  {"number": 12, "title": "Bump lodash", "author": {"login": "dependabot", "is_bot": true}, "isDraft": false,
@@ -494,9 +562,14 @@ echo Makefile > "$FAKE/files-14-2"
 #   #7  into another branch entirely                             -> not reported
 #   #6  into main, commit not local, merged after my branch point -> reported
 #   #5  into main, commit not local, merged long before it       -> not reported
+#   #4  this branch's own PR, squash-merged; work carried on      -> not reported
 cat > "$FAKE/merged.json" <<JSON
 [{"number": 9, "title": "Drop the legacy cart key", "author": {"login": "dev-c"}, "baseRefName": "main",
-  "mergedAt": "$NOW", "mergeCommit": {"oid": "$LANDED_OID"}, "url": "", "files": [], "changedFiles": 2},
+  "mergedAt": "$NOW", "mergeCommit": {"oid": "$LANDED_OID"}, "url": "", "files": [], "changedFiles": 4},
+ {"number": 4, "title": "My earlier round", "author": {"login": "me"}, "baseRefName": "main",
+  "headRefName": "feat/totals", "headRepositoryOwner": {"login": "acme"},
+  "mergedAt": "2099-01-01T00:00:00Z", "mergeCommit": {"oid": "4444444444444444444444444444444444444444"}, "url": "",
+  "files": [{"path": "Makefile"}, {"path": "shop/cart.py"}], "changedFiles": 2},
  {"number": 8, "title": "Already in your branch", "author": {"login": "dev-c"}, "baseRefName": "main",
   "mergedAt": "$NOW", "mergeCommit": {"oid": "$BASE_OID"}, "url": "", "files": [{"path": "Makefile"}], "changedFiles": 1},
  {"number": 7, "title": "Release", "author": {"login": "dev-c"}, "baseRefName": "release",
@@ -510,7 +583,8 @@ cat > "$FAKE/gh" <<'SH'
 #!/bin/sh
 case "$1 $2" in
   "auth token") exit 0 ;;
-  "pr list") case "$*" in
+  "pr list") [ -n "${EMSK_PR_FAKE_FAIL:-}" ] && { echo "HTTP 401: Bad credentials (https://api.github.com/graphql)" >&2; exit 1; }
+    case "$*" in
       *"--state open"*)   cat "$EMSK_PR_FAKE/open.json" ;;
       *"--state merged"*) cat "$EMSK_PR_FAKE/merged.json" ;;
     esac ;;
@@ -565,8 +639,23 @@ printf '%s' "$landed" | grep -q '> moved   format_price -> shop/money.py' \
   || bad "moved across files in a real range" "got: $landed"
 merged_sec="$(section '!! MERGED INTO main AFTER YOUR BRANCH POINT')"
 printf '%s' "$merged_sec" | grep -q '#9 ' && printf '%s' "$merged_sec" | grep -q 'shop/cart.py' \
-  && ok "merged PR not in the branch is listed, its files read from local git" \
+  && printf '%s' "$merged_sec" | grep -q 'shop/tax.py' \
+  && ok "merged PR not in the branch is listed, its files (old rename paths too) read from local git" \
   || bad "merged PR #9 listed with git-derived files" "got: $merged_sec"
+! printf '%s' "$merged_sec" | grep -q '#4 ' \
+  && ok "this branch's own merged PR is not a collision" || bad "own merged PR" "got: $merged_sec"
+printf '%s' "$landed" | grep -q 'shop/tax.py  (renamed to shop/taxes.py on the base: edit that, not this)' \
+  && printf '%s' "$landed" | grep -q 'shop/legacy.py  (deleted on the base)' \
+  && ok "a file the base renamed or deleted is listed under its old path, with what happened" \
+  || bad "renamed / deleted on base" "got: $landed"
+ecache0="$(cd "$E2E" && EMSK_PR_HOME="$TMPROOT/e2ecache" "$SH" "$SCAN" --cache-path)"
+jq -e '.base_gone["shop/__init__.py"] == "deleted"' "$ecache0" >/dev/null 2>&1 \
+  && ok "an empty file git pairs as a 'rename' is reported as deleted" \
+  || bad "empty-file rename" "got: $(jq -c .base_gone "$ecache0")"
+! printf '%s' "$digest" | LC_ALL=C grep -q "$(printf '\033')" \
+  && ok "control characters in PR titles never reach the digest" || bad "control characters stripped" ""
+jq -e '[.open[] | has("body")] | any | not' "$ecache0" >/dev/null 2>&1 \
+  && ok "full PR descriptions are not kept in the cache" || bad "body dropped from cache" ""
 ! printf '%s' "$merged_sec" | grep -q '#8 ' \
   && ok "a merged PR already in the branch is not reported" || bad "#8 already in branch" "got: $merged_sec"
 ! printf '%s' "$merged_sec" | grep -q '#7 ' \
@@ -603,6 +692,29 @@ printf '%s' "$ctx" | grep -q '_legacy_cart_key' \
   && ok "guard on the drifted file names the removed definition" || bad "guard names removed definition" "got: $ctx"
 printf '%s' "$ctx" | grep -q 'MOVED on main: format_price -> shop/money.py' \
   && ok "guard says where a moved definition went" || bad "guard moved line" "got: $ctx"
+ctx="$(guard_e2e shop/tax.py)"
+printf '%s' "$ctx" | grep -q 'Renamed to shop/taxes.py on origin/main since you branched: edit that file' \
+  && ok "guard on a file the base renamed points at the new name" || bad "guard renamed file" "got: $ctx"
+ctx="$(guard_e2e shop/legacy.py)"
+printf '%s' "$ctx" | grep -q 'Deleted on origin/main' \
+  && ok "guard on a file the base deleted says so" || bad "guard deleted file" "got: $ctx"
+# docs/notes.md changed on the base through no PR, and this branch had not
+# touched it when the scan ran.
+ctx="$(guard_e2e docs/notes.md)"
+printf '%s' "$ctx" | grep -q 'Changed on origin/main since you branched' \
+  && ok "guard warns on a drifted file first edited after the scan" || bad "guard full drift" "got: $ctx"
+
+# When GitHub refuses, the stale digest comes with gh's own reason, not a guess.
+fail="$(cd "$E2E" && PATH="$TMPROOT/bin-fake" EMSK_PR_FAKE="$FAKE" EMSK_PR_FAKE_FAIL=1 GIT_SSH_COMMAND=false \
+  EMSK_PR_HOME="$TMPROOT/e2ecache" "$SH" "$SCAN" --refresh 2>&1)"
+printf '%s' "$fail" | head -1 | grep -q 'could not refresh the PR digest: gh pr list failed: HTTP 401: Bad credentials' \
+  && printf '%s' "$fail" | grep -q 'WHAT IS OPEN' \
+  && ok "a failed refresh names gh's reason and still serves the last digest" \
+  || bad "failed refresh reason" "got: $(printf '%s' "$fail" | head -2)"
+leftover=""
+for f in "${ecache0%/*}"/*.tmp; do [ -e "$f" ] && leftover="$f"; done
+[ -z "$leftover" ] && ok "no temporary files left next to the cache" \
+  || bad "no temporary files left next to the cache" "found $leftover"
 
 # A long session: the scan is old by the time of this edit. The guard answers
 # at once from the old scan, says so, and starts a refresh in the background.
@@ -634,6 +746,19 @@ printf '%s' "$digest" | grep -q 'base upstream/main' && ! printf '%s' "$touch_op
   || bad "fork: upstream + own PR" "got: $digest"
 printf '%s' "$touch_open" | grep -q 'gh pr diff -R acme/shop ' \
   && ok "fork: digest's gh commands name the upstream repo" || bad "fork: digest gh -R" "got: $touch_open"
+
+# A branch checked out mid-session has no scan yet. The first edit on it says
+# nothing, and leaves a scan started for the next one.
+git -C "$E2E" checkout -qb feat/later
+newcache="$(cd "$E2E" && EMSK_PR_HOME="$TMPROOT/e2ecache" "$SH" "$SCAN" --cache-path)"
+out="$(printf '{"tool_name":"Edit","cwd":"%s","tool_input":{"file_path":"%s/Makefile"}}' "$E2E" "$E2E" \
+  | PATH="$TMPROOT/bin-fake" EMSK_PR_FAKE="$FAKE" GIT_SSH_COMMAND=false EMSK_PR_HOME="$TMPROOT/e2ecache" \
+    "$SH" "$GUARD" 2>&1)"; rc=$?
+[ -z "$out" ] && [ $rc -eq 0 ] && ok "new branch, no scan yet: the first edit is silent" \
+  || bad "new branch: first edit silent" "rc=$rc out=<$out>"
+i=0; while [ ! -f "$newcache" ] && [ $i -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
+[ -f "$newcache" ] && ok "new branch: the guard started its first scan in the background" \
+  || bad "new branch: background scan" "no cache at $newcache"
 
 echo
 echo "== live scan against a real repo =="
