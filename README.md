@@ -229,6 +229,10 @@ bash tests/test.sh                              # the whole suite
 claude plugin validate . --strict               # the manifests
 ```
 
+`bash demo/make-demo-repo.sh` builds the offline scenario the demo GIF was recorded in: a
+throwaway repo under `/tmp/emsk-pr-demo` and a fake `gh` that serves canned PR data from local
+files. It is not part of the plugin's hooks and never contacts GitHub.
+
 The tests run the scripts for real, against throwaway repos and a fake `gh`. The
 live section also scans a real repo (the one you run it from, or
 `EMSK_PR_TEST_REPO`) when `gh` is logged in. CI runs the suite on Ubuntu and macOS.
