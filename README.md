@@ -8,6 +8,12 @@
 keeps the agent current with the pull requests in flight: what is open, what just
 merged, and which of it collides with the branch you are on.
 
+![Claude Code with emsk-pr: before editing, it reads the open PR that touches the file, imports format_price from where main moved it, leaves the deleted helper deleted, and reports the conflict with PR #11](demo/emsk-pr.gif)
+
+*Recorded in the offline demo (`bash demo/make-demo-repo.sh`). Claude reads PR #11 before editing,
+imports `format_price` from where `main` moved it, leaves `_legacy_cart_key` deleted, and says the
+branch still conflicts with #11.*
+
 ## The problem
 
 You cut a branch. While you work, a teammate merges a PR that renames a helper or
