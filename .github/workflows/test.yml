@@ -39,4 +39,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck skills/emsk-pr/scan.sh skills/emsk-pr/guard.sh tests/test.sh
+      - run: shellcheck skills/emsk-pr/scan.sh skills/emsk-pr/guard.sh tests/test.sh demo/make-demo-repo.sh
