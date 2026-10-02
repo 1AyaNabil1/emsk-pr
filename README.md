@@ -1,9 +1,12 @@
 # emsk-pr
 
+[![tests](https://github.com/1AyaNabil1/emsk-pr/actions/workflows/test.yml/badge.svg)](https://github.com/1AyaNabil1/emsk-pr/actions/workflows/test.yml)
+[![version](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2F1AyaNabil1%2Femsk-pr%2Fmain%2F.claude-plugin%2Fplugin.json&query=%24.version&label=version)](https://github.com/1AyaNabil1/emsk-pr/releases/latest)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 **Catch what your teammates changed before you edit.** A Claude Code plugin that
 keeps the agent current with the pull requests in flight: what is open, what just
 merged, and which of it collides with the branch you are on.
-
 
 ## The problem
 
