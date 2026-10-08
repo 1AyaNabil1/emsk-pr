@@ -634,7 +634,7 @@ warm="$(cd "$E2E" && PATH="$TMPROOT/bin-fake" EMSK_PR_FAKE="$FAKE" EMSK_PR_HOME=
 printf '%s' "$digest" | grep -q 'base origin/main' \
   && ok "base taken from this branch's own PR, not the stranger's" || bad "base from own PR" "$(printf '%s' "$digest" | head -1)"
 # The lines under one '!!' header, up to the next header or the footer.
-section() { printf '%s\n' "$digest" | awk -v h="$1" '/^(!!|WHAT IS OPEN|\(emsk-pr)/ { on = (index($0, h) == 1); next } on'; }
+section() { printf '%s\n' "$digest" | awk -v h="$1" '/^(!!|WHAT IS OPEN|YOUR STACK|\(emsk-pr)/ { on = (index($0, h) == 1); next } on'; }
 # The guard against the e2e repo's cache. EMSK_PR_HOME is pinned too, so a
 # missing cache can never send it looking in the real one.
 ecache="$(cd "$E2E" && EMSK_PR_HOME="$TMPROOT/e2ecache" "$SH" "$SCAN" --cache-path)"
@@ -832,6 +832,148 @@ out="$(printf '{"tool_name":"Edit","cwd":"%s","tool_input":{"file_path":"%s/Make
 i=0; while [ ! -f "$newcache" ] && [ $i -lt 150 ]; do sleep 0.1; i=$((i + 1)); done
 [ -f "$newcache" ] && ok "new branch: the guard started its first scan in the background" \
   || bad "new branch: background scan" "no cache at $newcache"
+
+echo
+echo "== stacked PRs (fake gh, no network) =="
+
+# A three-PR stack onto staging, all mine: #21 feat/a -> staging, #22 feat/b ->
+# feat/a, #23 feat/c -> feat/b. feat/a has moved on since feat/b was cut, and
+# its new commit touches a line feat/b also changed. Two teammates: #24 on
+# staging, and #25 aimed at a release branch whose own history changes a line
+# feat/b changes too; #25 itself only touches a line nobody else does.
+STK="$TMPROOT/stack"
+mkrepo "$STK" origin=git@github.com:acme/shop.git
+git -C "$STK" config user.name test && git -C "$STK" config user.email test@example.com
+app() { printf 'a = %s\nb = 2\nc = %s\nd = %s\ne = 5\nf = %s\ng = 7\nh = %s\n' "$@" > "$STK/app.py"; }
+commit_as() { git -C "$STK" commit -qam "$1" && git -C "$STK" rev-parse HEAD; }
+app 1 3 4 6 8; git -C "$STK" add -A && git -C "$STK" commit -qm base && git -C "$STK" branch -M staging
+git -C "$STK" checkout -qb feat/a; app 10 3 4 6 8;    A1="$(commit_as "A: a")"
+git -C "$STK" checkout -qb feat/b; app 100 30 4 6 8;  B1="$(commit_as "B: a, c")"
+git -C "$STK" checkout -qb feat/c; app 100 30 40 6 8; C1="$(commit_as "C: d")"
+git -C "$STK" checkout -q feat/a;  app 10 33 4 6 8;   A2="$(commit_as "A: c, after B was cut")"
+git -C "$STK" checkout -qb mate staging; app 1 3 4 6 80; M1="$(commit_as "mate: h")"
+git -C "$STK" checkout -qb release staging; app 1 99 4 6 8; commit_as "release: c" >/dev/null
+git -C "$STK" checkout -qb r25 release; app 1 99 4 60 8; R25="$(commit_as "#25: f")"
+for b in staging feat/a feat/b feat/c release; do git -C "$STK" update-ref "refs/remotes/origin/$b" "$b"; done
+git -C "$STK" checkout -q feat/b && git -C "$STK" branch -qD mate r25
+
+SFAKE="$TMPROOT/stackgh"; mkdir -p "$SFAKE"
+pr() { # number title base head oid author
+  printf '{"number": %s, "title": "%s", "author": {"login": "%s", "is_bot": false}, "isDraft": false,
+    "baseRefName": "%s", "headRefName": "%s", "headRefOid": "%s", "headRepositoryOwner": {"login": "acme"},
+    "updatedAt": "2026-10-08T00:00:00Z", "url": "", "body": "", "files": [{"path": "app.py"}], "changedFiles": 1}' \
+    "$1" "$2" "$6" "$3" "$4" "$5"
+}
+{ echo '['; pr 21 "A" staging feat/a "$A2" me; echo ','; pr 22 "B" feat/a feat/b "$B1" me; echo ',';
+  pr 23 "C" feat/b feat/c "$C1" me; echo ','; pr 24 "Mate on h" staging mate "$M1" mate; echo ',';
+  pr 25 "Release fix on f" release r25 "$R25" mate2; echo ']'; } > "$SFAKE/open.json"
+echo '[]' > "$SFAKE/merged.json"
+stack_scan() {
+  (cd "$STK" && PATH="$TMPROOT/bin-fake" EMSK_PR_FAKE="$SFAKE" GIT_SSH_COMMAND=false \
+     EMSK_PR_HOME="$TMPROOT/stackcache" "$SH" "$SCAN" --refresh 2>&1)
+}
+
+digest="$(stack_scan)"
+printf '%s' "$digest" | head -1 | grep -q 'branch feat/b · base origin/staging' \
+  && ok "a stacked branch is compared with the bottom PR's target, not its parent" \
+  || bad "stack base is the root target" "got: $(printf '%s' "$digest" | head -1)"
+stk="$(section 'YOUR STACK')"
+printf '%s' "$stk" | grep -q '#21  feat/a -> staging  (under this branch)' \
+  && printf '%s' "$stk" | grep -q '#22  feat/b  (this branch)' \
+  && printf '%s' "$stk" | grep -q '#23  feat/c  (built on this branch)' \
+  && ok "the stack is listed bottom first: under, this branch, built on it" || bad "stack listing" "got: $stk"
+touch_open="$(section '!! OPEN PRs THAT TOUCH YOUR FILES')"
+! printf '%s' "$touch_open" | grep -qE '#2[123] ' \
+  && ok "PRs in my own stack are never collisions" || bad "stack PRs not collisions" "got: $touch_open"
+printf '%s' "$stk" | grep -q '#21 (feat/a) has 1 commit you do not have: rebase onto it. They CONFLICT with your last commit: app.py (~line 3)' \
+  && ok "a parent that moved on is reported, with the conflict its new commit brings" \
+  || bad "parent behind + conflict" "got: $stk"
+printf '%s' "$touch_open" | grep -A2 '^  #24 ' | grep -q 'merges cleanly' \
+  && ok "a teammate on the stack's target is still checked" || bad "teammate on staging" "got: $touch_open"
+printf '%s' "$touch_open" | grep -A2 '^  #25 ' | grep -q 'merges cleanly' \
+  && ok "a PR aimed at another branch is judged by its own changes, not the gap between branches" \
+  || bad "cross-branch PR" "got: $touch_open"
+# With a git too old to choose the merge base, it says so rather than guess.
+# Every tool but git is linked in; git is a new file of its own. Writing to a
+# link instead would write through it into the real git.
+mkdir -p "$TMPROOT/bin-oldgit"
+for t in "$TMPROOT/bin-fake"/*; do
+  [ "${t##*/}" = git ] || ln -sf "$(readlink "$t")" "$TMPROOT/bin-oldgit/${t##*/}"
+done
+real_git="$(readlink "$TMPROOT/bin-fake/git")"
+rm -f "$TMPROOT/bin-oldgit/git"
+# shellcheck disable=SC2016  # $1 and $@ belong to the wrapper, not this shell
+printf '#!/bin/sh\n[ "$1" = --version ] && { echo "git version 2.39.5"; exit 0; }\nexec "%s" "$@"\n' "$real_git" \
+  > "$TMPROOT/bin-oldgit/git" && chmod +x "$TMPROOT/bin-oldgit/git"
+old="$(cd "$STK" && PATH="$TMPROOT/bin-oldgit" EMSK_PR_FAKE="$SFAKE" GIT_SSH_COMMAND=false \
+  EMSK_PR_HOME="$TMPROOT/stackcache-old" "$SH" "$SCAN" --refresh 2>&1)"
+printf '%s\n' "$old" | grep -A2 '^  #25 ' | grep -q 'not checked for conflicts: it targets release, and comparing across branches needs git 2.40' \
+  && printf '%s\n' "$old" | grep -A2 '^  #24 ' | grep -q 'merges cleanly' \
+  && ok "with git 2.39, a PR aimed at another branch is marked unchecked, the rest still checked" \
+  || bad "cross-branch PR on old git" "got: $old"
+
+# An uncommitted edit to a line feat/c changes: rebasing #23 will now conflict.
+app 100 30 44 6 8
+digest="$(stack_scan)"
+section 'YOUR STACK' | grep -q '!! rebasing #23 onto your uncommitted work will CONFLICT: app.py (~line 4)' \
+  && ok "work that would make the PR built on this branch conflict is caught" || bad "child restack conflict" "got: $(section 'YOUR STACK')"
+scache="$(cd "$STK" && EMSK_PR_HOME="$TMPROOT/stackcache" "$SH" "$SCAN" --cache-path)"
+ctx="$(printf '{"tool_name":"Edit","cwd":"%s","tool_input":{"file_path":"%s/app.py"}}' "$STK" "$STK" \
+  | EMSK_PR_HOME="$TMPROOT/stackcache" EMSK_PR_CACHE_FILE="$scache" "$SH" "$GUARD" 2>&1 \
+  | jq -r '.hookSpecificOutput.additionalContext // ""')"
+printf '%s' "$ctx" | grep -q 'Rebasing #23, built on this branch, will CONFLICT here (~line 4)' \
+  && printf '%s' "$ctx" | grep -q 'Your stack parent #21 has new commits that CONFLICT here (~line 3)' \
+  && ! printf '%s' "$ctx" | grep -q 'OPEN: .*#2[123]' \
+  && ok "the guard names rebases within the stack, and no stack PR as a collision" \
+  || bad "guard on a stacked branch" "got: $ctx"
+git -C "$STK" checkout -q -- app.py
+
+# From the bottom: what is built on it is mine too, and its rebase is foreseen.
+git -C "$STK" checkout -q feat/a
+digest="$(stack_scan)"
+stk="$(section 'YOUR STACK')"
+printf '%s' "$stk" | grep -q '#22  feat/b  (built on this branch)' && printf '%s' "$stk" | grep -q '#23  feat/c  (built on this branch)' \
+  && printf '%s' "$stk" | grep -q '!! rebasing #22 onto your last commit will CONFLICT: app.py (~line 3)' \
+  && ! section '!! OPEN PRs THAT TOUCH YOUR FILES' | grep -qE '#2[23] ' \
+  && ok "the bottom of a stack lists what is built on it, and the rebase it now needs" \
+  || bad "bottom of the stack" "got: $digest"
+
+# A branch with no PR yet, cut from feat/b: its stack is found from its commits.
+git -C "$STK" checkout -q -b feat/d feat/b; app 100 30 4 6 8; printf 'e2 = 50\n' >> "$STK/app.py"; commit_as "D" >/dev/null
+digest="$(stack_scan)"
+printf '%s' "$digest" | grep -q 'this branch has no PR yet; its stack was found from its commits' \
+  && section 'YOUR STACK' | grep -q '#22  feat/b -> feat/a  (under this branch)' \
+  && printf '%s' "$digest" | head -1 | grep -q 'base origin/staging' \
+  && ok "a branch with no PR is placed in its stack by its commits" || bad "inferred stack" "got: $digest"
+# #23 is built on feat/b too: beside this branch. It is still checked, from
+# feat/b where both start, so it neither hides nor gets blamed for feat/b.
+printf '%s' "$digest" | grep -q '#23 (built on your stack)  C' \
+  && section '!! OPEN PRs THAT TOUCH YOUR FILES' | grep -A2 '^  #23 ' | grep -q 'merges cleanly' \
+  && ! section '!! OPEN PRs THAT TOUCH YOUR FILES' | grep -A3 '^  #23 ' | grep -q 'unsettled' \
+  && ok "a PR beside this branch in the stack is labelled and compared from their shared branch" \
+  || bad "sibling in the stack" "got: $digest"
+
+# A branch cut from staging, no PR: its base is guessed, and the digest says so.
+git -C "$STK" checkout -q -b solo staging; app 1 3 4 6 8; printf 'z = 1\n' >> "$STK/app.py"; commit_as "solo" >/dev/null
+digest="$(stack_scan)"
+printf '%s' "$digest" | head -1 | grep -q 'base origin/staging' \
+  && printf '%s' "$digest" | grep -q 'base guessed from git history; pin it with: git config emsk-pr.base' \
+  && ! printf '%s' "$digest" | grep -q 'YOUR STACK' \
+  && ok "an unstacked branch with no PR gets staging as a labelled guess, not a PR branch" \
+  || bad "guessed base" "got: $(printf '%s' "$digest" | head -3)"
+
+# #21 is squash-merged: staging gets one new commit with its change, GitHub
+# retargets #22 to staging, and feat/b still carries #21's original commit.
+git -C "$STK" checkout -q -b squash staging; app 10 3 4 6 8; SQ="$(commit_as "Squash of #21")"
+git -C "$STK" update-ref refs/remotes/origin/staging "$SQ"; git -C "$STK" checkout -q feat/b; git -C "$STK" branch -qD squash
+{ echo '['; pr 22 "B" staging feat/b "$B1" me; echo ','; pr 23 "C" feat/b feat/c "$C1" me; echo ']'; } > "$SFAKE/open.json"
+printf '[{"number": 21, "title": "A", "author": {"login": "me"}, "baseRefName": "staging", "headRefName": "feat/a",
+  "headRefOid": "%s", "mergedAt": "2099-01-01T00:00:00Z", "mergeCommit": {"oid": "%s"}, "url": "",
+  "files": [{"path": "app.py"}], "changedFiles": 1}]' "$A1" "$SQ" > "$SFAKE/merged.json"
+digest="$(stack_scan)"
+printf '%s' "$digest" | grep -q '#21 (feat/a), which this branch is built on, was merged into staging: rebase onto origin/staging' \
+  && ! section '!! MERGED INTO staging AFTER YOUR BRANCH POINT' | grep -q '#21 ' \
+  && ok "a squash-merged parent is a rebase to do, not someone else's merge" || bad "absorbed parent" "got: $digest"
 
 echo
 echo "== live scan against a real repo =="

@@ -126,6 +126,18 @@ To update: `/plugin marketplace update emsk-pr`, then `/plugin update emsk-pr@em
   and your own PR is recognised by the fork it lives in.
 - **Skips your own PR.** The PR opened from your branch is labelled
   `(this branch)` and is never reported as a collision.
+- **Understands stacked PRs.** When your PR targets another PR's branch (or,
+  before you open one, when your branch carries another PR's commits), the
+  digest shows the whole stack bottom first. The PRs under you and built on you
+  are never collisions; the stack is compared, as one piece of work, with what
+  its bottom PR targets. It also tells you when the parent has commits you lack
+  (and whether they conflict with you), when your work would make rebasing a PR
+  built on your branch conflict, and when a parent was squash-merged and you
+  should rebase onto the base. A teammate's PR built on a branch of your stack
+  is labelled and still checked, from the branch you share.
+- **Compares PRs aimed elsewhere fairly.** A PR that targets a different branch
+  from yours is judged by its own changes, not by everything that differs
+  between the two branches (needs git 2.40; older git marks it unchecked).
 - **Knows many languages.** Definition changes are tracked for Python, Go,
   TypeScript/JavaScript, Svelte, Vue, SQL, Rust, Ruby, Kotlin, Swift, Java, C#,
   PHP and Scala (classes and types everywhere; functions where the language has a
@@ -146,8 +158,11 @@ git config emsk-pr.base develop
 git config --global emsk-pr.hosts github.mycompany.com
 ```
 
-Detected base = the branch your PR targets, else the branch most merged PRs
-target, else the repo's default branch.
+Detected base = what the bottom PR of your stack targets (for an ordinary PR,
+just its target). With no PR yet, the stack is found from your branch's
+commits; failing that, the base is the branch yours split from most recently,
+ties going to the branch more PRs target. The digest says when it guessed, and
+`emsk-pr.base` always wins.
 
 Environment variables, for tuning:
 

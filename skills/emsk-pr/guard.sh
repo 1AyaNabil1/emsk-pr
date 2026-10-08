@@ -117,13 +117,28 @@ MSG="$(jq -r --arg f "$REL" --argjson age "$AGE" --argjson ttl "$TTL" '
       else empty end ] as $trials |
   [$trials[] | select(.t == "conflict")] as $tc |
   ($base_conflict != null or ($tc | length) > 0) as $conflicted |
+  # Within my own stack: new commits on the parent, and the PRs built on this
+  # branch, against my work on this file. These mean a rebase, not a collision.
+  ((($cf.parent // {}).files // {})[$f]) as $pconf |
+  [ ($cf.children // {}) | to_entries[] | select(.value.files[$f] != null)
+    | {n: .key, w: (.value.files[$f] | where)} ] as $kconf |
+  ($pconf != null or ($kconf | length) > 0) as $restack |
   def nums: map("#\(.n)") | some(3);
   if (($hit.open | length) == 0) and (($hit.merged | length) == 0) and ($sym == null)
-     and ($drifted | not) then
+     and ($drifted | not) and ($restack | not) then
     ""
   else
     ([ if $conflicted then "emsk-pr: \($f) has merge CONFLICTS with other work."
+       elif $restack and (($hit.open | length) + ($hit.merged | length)) == 0 then
+         "emsk-pr: \($f) will need a rebase within your stack."
        else "emsk-pr: \($f) is contested — other work touches this same file." end ]
+     + (if $pconf != null then
+          [ "  Your stack parent #\(.stack.parent.number) has new commits that CONFLICT here\($pconf | where): rebase onto it first." ]
+        else [] end)
+     + (if ($kconf | length) > 0 then
+          [ "  Rebasing #\($kconf[0].n), built on this branch, will CONFLICT here\($kconf[0].w)"
+            + (if ($kconf | length) > 1 then " (and \($kconf[1:] | map("#\(.n)") | join(", ")))" else "" end) + "." ]
+        else [] end)
      + (if $base_conflict != null then
           [ "  CONFLICTS with \($remote)/\(.base) here\($base_conflict | where): merge it in before building on this file." ]
         else [] end)

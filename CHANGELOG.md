@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.4.0 — 2026-10-08
+
+Stacked PRs.
+
+- A branch's stack is found by following PR links: the PR whose head is this
+  PR's base is its parent, and PRs whose base is this branch are built on it.
+  With no PR yet, a branch that carries another PR's commits is placed on it.
+  These PRs are never collisions. The digest lists the stack bottom first under
+  `YOUR STACK`, and labels them in the open list.
+- The whole stack is compared with what its bottom PR targets, so teammates'
+  merges into that branch are tracked from every branch in the stack.
+- New stack checks: the parent has N commits this branch lacks, and whether they
+  conflict with it; rebasing a PR built on this branch would conflict with the
+  work here; a parent was squash-merged and this branch should rebase onto the
+  base. The guard names these for the file being edited.
+- A teammate's PR built on a branch of your stack is labelled `(built on your
+  stack)` and compared with your work from the branch you both start on.
+- A PR aimed at a different branch from yours is compared by its own changes,
+  not by everything that differs between the two branches (git 2.40's
+  `merge-tree --merge-base`; with an older git it is marked unchecked).
+- With no PR and no setting, the base is the branch this one split from most
+  recently, ties going to the branch more PRs target, instead of where most
+  recent merges went. The digest says when the base was guessed.
+
 ## 1.3.0 — 2026-10-01
 
 Real conflicts, not just shared files.

@@ -41,7 +41,8 @@ or after a teammate says they merged something.
 
 | Section | What it means |
 |---|---|
-| `WHAT IS OPEN` | Every open PR, one line: number, draft flag, title, author, first line of the body. `(this branch)` marks the PR opened from the current branch. Bot PRs are folded into one line. This is the "keep me updated" answer — report it when asked. |
+| `WHAT IS OPEN` | Every open PR, one line: number, draft flag, title, author, first line of the body. `(this branch)` marks the PR opened from the current branch; `(your stack, …)` the PRs under it or built on it; `(built on your stack)` a PR built on a lower branch of the stack, beside this one. Bot PRs are folded into one line. This is the "keep me updated" answer — report it when asked. |
+| `YOUR STACK` | The stacked PRs this branch belongs to, bottom first, and the target the whole stack is compared with. `!!` lines say what keeping it in shape takes: the parent has commits this branch lacks (and whether they conflict with it), rebasing a PR built on this branch would conflict, or a parent was merged and this branch should rebase onto the base. |
 | `YOUR WORK ALREADY CONFLICTS WITH <remote>/<base>` | A trial merge of your work (uncommitted edits included) into the base tip failed in these files, with roughly which lines. |
 | `OPEN PRs THAT TOUCH YOUR FILES` | Someone else is editing the same file right now. Under each, the trial merge's verdict: `CONFLICTS with …` (your edits and theirs meet, at those lines), `merges cleanly` (same files, different lines), or `unsettled` (their PR conflicts with the base there, so their final version is not known). Conflicting PRs come first. |
 | `LANDED ON <remote>/<base> SINCE YOUR BRANCH POINT` | Files that moved under the branch. The local copy is older than the base branch. `(renamed to X …)` and `(deleted …)` mark files the base no longer has under that name. |
@@ -79,7 +80,12 @@ began and has no scan, the guard starts one in the background.
    If the base **renamed** it, make the change in the new file. If the base
    **deleted** it, find out why (`git log <remote>/<base> -- <path>`) before
    editing it back into existence.
-6. **Report the open-PR list when asked what is going on.** That is the whole point
+6. **PRs in `YOUR STACK` are not collisions.** They are the branch's own line of
+   work, even when a teammate opened the one underneath. Act on the `!!` lines
+   instead: rebase onto a parent with new commits before building more on the
+   lines they touch, and tell the user when rebasing a PR built on this branch
+   will conflict, so it is not a surprise.
+7. **Report the open-PR list when asked what is going on.** That is the whole point
    of the section; do not summarise it away to one sentence.
 
 ## Red flags — stop
@@ -110,7 +116,7 @@ Per repo, as git config (add `--global` for every repo):
 | Key | Effect |
 |---|---|
 | `emsk-pr.remote` | Remote whose PRs to read. Default: `upstream` if it exists (forks), else `origin`. |
-| `emsk-pr.base` | Base branch. Default: what this branch's PR targets, else what most merged PRs target, else the default branch. |
+| `emsk-pr.base` | Base branch. Default: what the bottom PR of this branch's stack targets (for an unstacked PR, simply its target); with no PR yet, the stack is found from the branch's commits, else the base is the branch it split from most recently, and the digest says it guessed. |
 | `emsk-pr.hosts` | Extra GitHub Enterprise hostnames, space-separated. |
 
 `EMSK_PR_CONFLICTS=0` turns the trial merges off. They need git 2.38 or newer;
