@@ -480,7 +480,7 @@ guess_base() {
   def="$(git -C "$ROOT" symbolic-ref --short -q "refs/remotes/$REMOTE_NAME/HEAD" 2>/dev/null)"
   def="${def#"$REMOTE_NAME"/}"
   while IFS= read -r c; do
-    [ -n "$c" ] && [ "$c" != "$BRANCH" ] || continue
+    if [ -z "$c" ] || [ "$c" = "$BRANCH" ]; then continue; fi
     jq -e --arg c "$c" --arg o "$REPO_OWNER" 'any(.[]; .headRefName == $c
         and ((.headRepositoryOwner.login // "") | ascii_downcase) == ($o | ascii_downcase))' \
       "$TMP/open.json" >/dev/null 2>&1 && continue
