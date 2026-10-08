@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/skills/emsk-pr/scan.sh\"",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/skills/emsk-pr/scan.sh\" --hook",
             "timeout": 55,
             "statusMessage": "emsk-pr: catching up on open PRs"
           }

@@ -6,6 +6,8 @@
 #   scan.sh --refresh          refresh first, always
 #   scan.sh --quiet            refresh, print nothing
 #   scan.sh --doctor           say why a digest is, or is not, being produced
+#   scan.sh --hook             the digest as Claude Code SessionStart JSON, plus a
+#                              message for the user when an update is out
 #   scan.sh --cache-path       print where this repo+branch caches (no network)
 #   scan.sh --extract-symbols  read a unified diff on stdin, print {file: {added,removed,changed,moved}}
 #
@@ -34,13 +36,14 @@ CONFLICTS="${EMSK_PR_CONFLICTS:-1}" # 0 skips the trial merges against open PRs 
 # prompt would only stall the session until the timeout.
 export GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1
 
-usage() { sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 MODE="auto"
 case "${1:-}" in
   --refresh)         MODE="refresh" ;;
   --quiet)           MODE="quiet" ;;
   --doctor)          MODE="doctor" ;;
+  --hook)            MODE="hook" ;;
   --cache-path)      MODE="cache-path" ;;
   --extract-symbols) MODE="extract" ;;
   -h|--help)         usage; exit 0 ;;
@@ -302,6 +305,90 @@ fallback() { # $1 = why, as a short clause
   esac
   exit 0
 }
+
+# ------------------------------------------------------------- self update ---
+# The installed version comes from the plugin manifest two levels above this
+# script; the latest is the newest release of the repo that manifest names,
+# looked up at most once a day and cached in $EMSK_PR_HOME.
+PLUGIN_JSON="$HERE/../../.claude-plugin/plugin.json"
+LATEST_FILE="$EMSK_PR_HOME/latest-release"
+
+installed_version() { jq -r '.version // empty' "$PLUGIN_JSON" 2>/dev/null; }
+
+version_gt() { # $1 > $2, comparing x.y.z numerically; anything else counts as 0
+  local IFS=. i x y
+  local -a a b
+  read -r -a a <<< "$1"; read -r -a b <<< "$2"
+  for i in 0 1 2; do
+    x="${a[$i]:-0}"; x="${x%%[!0-9]*}"; y="${b[$i]:-0}"; y="${y%%[!0-9]*}"
+    [ "${x:-0}" -gt "${y:-0}" ] && return 0
+    [ "${x:-0}" -lt "${y:-0}" ] && return 1
+  done
+  return 1
+}
+
+# Refresh the cached latest release in the background, once a day. The stamp
+# is touched before the lookup, so a day offline is one try, not one per session.
+check_latest() {
+  local stamp="$LATEST_FILE.checked" url repo
+  if ! command -v gh >/dev/null 2>&1; then return 0; fi
+  if [ -f "$stamp" ]; then
+    [ $(( $(date +%s) - $(stat -c %Y "$stamp" 2>/dev/null || stat -f %m "$stamp" 2>/dev/null || echo 0) )) -lt 86400 ] && return 0
+  fi
+  url="$(jq -r '.repository // empty' "$PLUGIN_JSON" 2>/dev/null)"
+  if ! parse_remote "$url" || [ "$RHOST" != "github.com" ]; then return 0; fi
+  repo="$RSLUG"
+  if ! mkdir -p "$EMSK_PR_HOME" 2>/dev/null || ! : > "$stamp"; then return 0; fi
+  ( run_timeout 8 gh api --hostname github.com "repos/$repo/releases/latest" --jq .tag_name \
+      > "$LATEST_FILE.$$" 2>/dev/null && [ -s "$LATEST_FILE.$$" ] && mv -f "$LATEST_FILE.$$" "$LATEST_FILE"
+    rm -f "$LATEST_FILE.$$" ) </dev/null >/dev/null 2>&1 &
+}
+
+# One sentence for the user when the cached latest release is newer than this
+# copy, with the update commands for the way it was installed.
+update_notice() {
+  local have latest mkt name dir
+  [ -s "$LATEST_FILE" ] || return 0
+  have="$(installed_version)"
+  latest="$(head -1 "$LATEST_FILE")"; latest="${latest##*--v}"; latest="${latest#v}"
+  if [ -z "$have" ] || [ -z "$latest" ] || ! version_gt "$latest" "$have"; then return 0; fi
+  case "$HERE" in
+    */plugins/cache/*/skills/*)
+      # .../plugins/cache/<marketplace>/<plugin>/<version>/skills/<skill>
+      mkt="${HERE%/*/*/skills/*}"; mkt="${mkt##*/}"
+      name="$(jq -r '.name // "emsk-pr"' "$PLUGIN_JSON" 2>/dev/null)"
+      printf 'emsk-pr %s is out (you have %s). To update: /plugin marketplace update %s, then /plugin update %s@%s, and restart Claude Code.' \
+        "$latest" "$have" "$mkt" "$name" "$mkt" ;;
+    *)
+      dir="$(cd "$HERE/../.." 2>/dev/null && pwd)"
+      if [ -n "$dir" ] && git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+        printf 'emsk-pr %s is out (you have %s). To update: git -C "%s" pull' "$latest" "$have" "$dir"
+      else
+        printf 'emsk-pr %s is out (you have %s).' "$latest" "$have"
+      fi ;;
+  esac
+}
+
+# Claude Code's SessionStart hook takes JSON: the digest goes to Claude as
+# additionalContext, and systemMessage is shown to the user. A one-line
+# "emsk-pr: ..." hint (a missing tool, a failed refresh) is for the user too.
+if [ "$MODE" = "hook" ]; then
+  out="$(bash "${BASH_SOURCE[0]}" 2>/dev/null)"
+  [ -n "$out" ] || exit 0
+  if ! command -v jq >/dev/null 2>&1; then printf '%s\n' "$out"; exit 0; fi
+  check_latest
+  notice="$(update_notice)"
+  msg=""
+  case "$out" in "emsk-pr: "*) msg="${out%%$'\n'*}" ;; esac
+  if [ -n "$notice" ]; then
+    msg="${msg:+$msg$'\n'}$notice"
+    out="$out"$'\n'"($notice)"
+  fi
+  jq -n --arg ctx "$out" --arg msg "$msg" \
+    '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}
+     + (if $msg != "" then {systemMessage: $msg} else {} end)'
+  exit 0
+fi
 
 # ------------------------------------------------------------------ where ---
 [ "$MODE" = "doctor" ] && echo "emsk-pr doctor"
@@ -1023,7 +1110,12 @@ CONF='def ours: if .ours == "working-tree" then "your uncommitted work" else "yo
                      then " (~line \(.value.lines[0:3] | map(tostring) | join(", ")))" else "" end)
                   + (if .value.kind != "content" then " [\(.value.kind)]" else "" end);
   def cfiles: to_entries | map(cfile)
-              | if length > 3 then (.[0:3] | join(" · ")) + " (+\(length - 3) more)" else join(" · ") end; '
+              | if length > 2 then (.[0:2] | join(" · ")) + " (+\(length - 2) more)" else join(" · ") end; '
+
+# The digest, with the open-PR list as long as $1 allows: 0 in full, 1 without
+# descriptions, 2 one line per PR, 3 only the newest ten.
+write_digest() {
+local level="$1"
 {
   printf '=== emsk-pr: %s · branch %s · base %s/%s ===\n' "$PR_SLUG" "$BRANCH" "$REMOTE_NAME" "$BASE"
 
@@ -1038,14 +1130,18 @@ CONF='def ours: if .ours == "working-tree" then "your uncommitted work" else "yo
   printf '\nWHAT IS OPEN (%s)\n' "$(jq -r '.open | length' "$CACHE")"
   # Bot PRs (dependency bumps and the like) are folded into one line here; they
   # still count below when they touch your files.
-  jq -r --argjson blurbs "$([ "$BLURBS" = 0 ] && echo false || echo true)" '
-    .open | map(select(.author.is_bot != true)) | sort_by(.updatedAt) | reverse | .[] |
+  local blurbs=true
+  if [ "$BLURBS" = 0 ] || [ "$level" -ge 1 ]; then blurbs=false; fi
+  jq -r --argjson blurbs "$blurbs" --argjson level "$level" '
+    .open | map(select(.author.is_bot != true)) | sort_by(.updatedAt) | reverse
+    | (if $level >= 3 then .[0:10] else . end) as $shown | ($shown[] |
     "  #\(.number)\(if .isDraft then " DRAFT" else "" end)\(if .own then " (this branch)"
        elif .stack == "under" then " (your stack, under this branch)"
        elif .stack == "over" then " (your stack, built on this branch)"
        elif .stack == "beside" then " (built on your stack)" else "" end)  \(.title)"
-    + "\n         @\(.author.login)"
-    + (if $blurbs and (.blurb | length) > 0 then "  — \(.blurb)" else "" end)' "$CACHE"
+    + (if $level >= 2 then "  @\(.author.login)" else "\n         @\(.author.login)" end)
+    + (if $blurbs and (.blurb | length) > 0 then "  — \(.blurb)" else "" end)),
+      (if length > ($shown | length) then "  (+\(length - ($shown | length)) more open: gh pr list)" else empty end)' "$CACHE"
   jq -r '[.open[] | select(.author.is_bot == true)] | select(length > 0) |
     "  + \(length) bot PR\(if length > 1 then "s" else "" end): \(map("#\(.number)") | join(" "))"
     + " (\(map(.author.login) | unique | join(", ")))"' "$CACHE"
@@ -1132,6 +1228,17 @@ CONF='def ours: if .ours == "working-tree" then "your uncommitted work" else "yo
       "  (only the newest merges were read; the file list above under LANDED ON is complete)"' "$CACHE"
   fi
 } > "$DIGEST.$$.tmp" 2>/dev/null
+}
+
+# Hook output past 10,000 characters reaches Claude only as a 2,000-character
+# preview and a file path, so the digest is held to 9,000 bytes, leaving room
+# for the footer and a notice. The open-PR list gives way first, step by step;
+# the collision sections below it are never cut.
+level=0
+write_digest 0
+while [ "$(wc -c < "$DIGEST.$$.tmp" | tr -d ' ')" -gt 9000 ] && [ "$level" -lt 3 ]; do
+  level=$((level + 1)); write_digest "$level"
+done
 mv -f "$DIGEST.$$.tmp" "$DIGEST"
 
 [ "$MODE" = "quiet" ] || serve_digest

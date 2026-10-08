@@ -91,6 +91,10 @@ Restart the session. You need:
   may work but has not been tested.
 
 To update: `/plugin marketplace update emsk-pr`, then `/plugin update emsk-pr@emsk-pr`.
+From 1.5.0 on, emsk-pr tells you itself when a newer release is out: once a
+day it looks up the latest release on GitHub, in the background, and the next
+session start shows you a one-line notice with these commands. To get updates
+without asking, turn on auto-update for the emsk-pr marketplace in `/plugin`.
 
 ## How it behaves
 
@@ -122,6 +126,10 @@ To update: `/plugin marketplace update emsk-pr`, then `/plugin update emsk-pr@em
   branch checked out mid-session. The edit is never delayed.
 - **Cheap.** A refresh takes a few seconds and is cached for 30 minutes. The edit
   guard itself never waits on the network.
+- **Fits.** Claude Code passes at most 10,000 characters of hook output to
+  Claude, so the digest is held under 9,000. In a very busy repo the open-PR
+  list gets shorter first (descriptions go, then one line per PR, then the
+  newest ten); the collision sections are never cut.
 - **Understands forks.** If you have an `upstream` remote, PRs are read from there,
   and your own PR is recognised by the fork it lives in.
 - **Skips your own PR.** The PR opened from your branch is labelled
@@ -235,6 +243,10 @@ shape from `~/.codex/hooks.json`):
 ```
 
 Don't do both. With the plugin and manual hooks together, every hook runs twice.
+
+In Claude Code, `scan.sh --hook` (what the plugin uses) also shows you update
+notices and missing-tool hints directly. It prints Claude Code's JSON hook
+format, so keep the plain command for agents that read plain text.
 
 ## Development
 

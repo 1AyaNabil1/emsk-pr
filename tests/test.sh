@@ -608,6 +608,8 @@ case "$1 $2" in
     esac ;;
   "api --hostname")  # repos/<o>/<r>/pulls/<n>/files?per_page=100&page=<p>, already --jq'd
     for a in "$@"; do case "$a" in repos/*) path="$a" ;; esac; done
+    case "$path" in */releases/latest)  # the newest release tag, when the test sets one
+      [ -f "$EMSK_PR_FAKE/latest_tag" ] && cat "$EMSK_PR_FAKE/latest_tag" || exit 1; exit 0 ;; esac
     n="${path#*/pulls/}"; n="${n%%/*}"; p="${path##*page=}"
     [ -f "$EMSK_PR_FAKE/files-$n-$p" ] && cat "$EMSK_PR_FAKE/files-$n-$p" || exit 1 ;;
   *) exit 1 ;;
@@ -974,6 +976,73 @@ digest="$(stack_scan)"
 printf '%s' "$digest" | grep -q '#21 (feat/a), which this branch is built on, was merged into staging: rebase onto origin/staging' \
   && ! section '!! MERGED INTO staging AFTER YOUR BRANCH POINT' | grep -q '#21 ' \
   && ok "a squash-merged parent is a rebase to do, not someone else's merge" || bad "absorbed parent" "got: $digest"
+
+echo
+echo "== the SessionStart hook: JSON, update notice, size budget =="
+
+HOOK_HOME="$TMPROOT/hookhome"
+hook_run() { # $1 = repo, $2 = scan.sh to run (default: this checkout's)
+  (cd "$1" && PATH="$TMPROOT/bin-fake" EMSK_PR_FAKE="$SFAKE" GIT_SSH_COMMAND=false \
+     EMSK_PR_HOME="$HOOK_HOME" "$SH" "${2:-$SCAN}" --hook 2>&1)
+}
+HAVE="$(jq -r .version "$HERE/../.claude-plugin/plugin.json")"
+git -C "$STK" checkout -q feat/b
+
+out="$(hook_run "$STK")"
+printf '%s' "$out" | jq -e '.hookSpecificOutput.hookEventName == "SessionStart"
+    and (.hookSpecificOutput.additionalContext | test("WHAT IS OPEN")) and (has("systemMessage") | not)' >/dev/null 2>&1 \
+  && ok "--hook wraps the digest as SessionStart additionalContext, no message when up to date" \
+  || bad "--hook JSON" "got: ${out:0:300}"
+out="$(cd "$TMPROOT" && EMSK_PR_HOME="$HOOK_HOME" "$SH" "$SCAN" --hook 2>&1)"; rc=$?
+[ -z "$out" ] && [ $rc -eq 0 ] && ok "--hook outside a GitHub repo: silent, exit 0" || bad "--hook silent outside GitHub" "rc=$rc out=<$out>"
+out="$(cd "$TMPROOT/gh" && PATH="$TMPROOT/bin-nogh" EMSK_PR_HOME="$HOOK_HOME" "$SH" "$SCAN" --hook 2>&1)"
+printf '%s' "$out" | jq -e '.systemMessage | startswith("emsk-pr: no PR digest for acme/shop")' >/dev/null 2>&1 \
+  && ok "a missing-tool hint is shown to the user, not only to Claude" || bad "hint as systemMessage" "got: $out"
+
+# The daily check fills the cache in the background, from the newest release.
+echo "emsk-pr--v$HAVE" > "$SFAKE/latest_tag"
+rm -f "$HOOK_HOME/latest-release.checked"   # the runs above already used today's check
+hook_run "$STK" >/dev/null
+i=0; while [ ! -s "$HOOK_HOME/latest-release" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+[ "$(cat "$HOOK_HOME/latest-release" 2>/dev/null)" = "emsk-pr--v$HAVE" ] \
+  && ok "the latest release is looked up in the background and cached" || bad "latest release cached" "$(ls -la "$HOOK_HOME")"
+out="$(hook_run "$STK")"
+printf '%s' "$out" | jq -e 'has("systemMessage") | not' >/dev/null 2>&1 \
+  && ok "the same version as installed: no notice" || bad "no notice when current" "got: ${out:0:300}"
+
+echo "emsk-pr--v99.0.0" > "$HOOK_HOME/latest-release"
+out="$(hook_run "$STK")"
+printf '%s' "$out" | jq -e --arg h "$HAVE" '(.systemMessage | startswith("emsk-pr 99.0.0 is out (you have \($h)). To update: git -C"))
+    and (.hookSpecificOutput.additionalContext | test("99.0.0 is out"))' >/dev/null 2>&1 \
+  && ok "a newer release: the user is told, with git pull for a checkout" || bad "notice for a checkout" "got: ${out:0:400}"
+# Installed through a marketplace: the plugin commands, with its name.
+PLUG="$TMPROOT/plugins/cache/mymkt/emsk-pr/1.0.0"
+mkdir -p "$PLUG/.claude-plugin" && cp -R "$SKILL/.." "$PLUG/skills" 2>/dev/null
+printf '{"name": "emsk-pr", "version": "1.0.0", "repository": "https://github.com/acme/emsk-pr"}\n' > "$PLUG/.claude-plugin/plugin.json"
+out="$(hook_run "$STK" "$PLUG/skills/emsk-pr/scan.sh")"
+printf '%s' "$out" | jq -e '.systemMessage == "emsk-pr 99.0.0 is out (you have 1.0.0). To update: /plugin marketplace update mymkt, then /plugin update emsk-pr@mymkt, and restart Claude Code."' >/dev/null 2>&1 \
+  && ok "a newer release, plugin install: the marketplace and plugin update commands" || bad "notice for a plugin" "got: ${out:0:400}"
+rm -f "$HOOK_HOME/latest-release"
+
+# 150 open PRs with long descriptions would blow the 10,000-character hook
+# limit, even one line each. The open list gives way to the newest ten; the
+# collision section stays.
+BIG="$TMPROOT/bigfake"; mkdir -p "$BIG"
+jq -n '[range(150) as $i | {number: (100 + $i),
+    title: "A reasonably long pull request title, as real ones are \($i)", author: {login: "dev\($i)", is_bot: false},
+    isDraft: false, baseRefName: "staging", headRefName: "topic-\($i)", headRepositoryOwner: {login: "acme"},
+    updatedAt: "2026-10-0\($i % 9 + 1)T00:00:00Z", url: "",
+    body: "This description runs on for a while, as descriptions written by people who care tend to do, explaining the why \($i).",
+    files: [{path: (if $i == 0 then "app.py" else "other/f\($i).py" end)}], changedFiles: 1}]' > "$BIG/open.json"
+echo '[]' > "$BIG/merged.json"
+digest="$(cd "$STK" && PATH="$TMPROOT/bin-fake" EMSK_PR_FAKE="$BIG" GIT_SSH_COMMAND=false \
+  EMSK_PR_HOME="$TMPROOT/bigcache" "$SH" "$SCAN" --refresh 2>&1)"
+len="$(printf '%s' "$digest" | LC_ALL=C wc -c | tr -d ' ')"
+[ "$len" -le 9500 ] && printf '%s' "$digest" | grep -q '(+140 more open: gh pr list)' \
+  && ! printf '%s' "$digest" | grep -q 'This description runs on' \
+  && section '!! OPEN PRs THAT TOUCH YOUR FILES' | grep -q '#100 ' \
+  && ok "a huge digest stays under the hook limit ($len bytes): open list shortened, collisions kept" \
+  || bad "digest size budget" "len=$len; $(printf '%s' "$digest" | sed -n '/WHAT IS OPEN/,+3p')"
 
 echo
 echo "== live scan against a real repo =="

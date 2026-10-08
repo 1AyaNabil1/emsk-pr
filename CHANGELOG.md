@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.5.0 — 2026-10-08
+
+Telling people about updates.
+
+- Once a day, in the background, emsk-pr looks up the latest release of the
+  repo its manifest names. When it is newer than the installed copy, the next
+  session start shows the user a one-line notice with the update commands for
+  the way it was installed: `/plugin marketplace update` and `/plugin update`
+  for a plugin, `git pull` for a checkout. Claude sees the line too.
+- The session-start hook now uses Claude Code's JSON hook output (`scan.sh
+  --hook`): the digest goes to Claude, and messages meant for the user (the
+  update notice, a missing `jq` or `gh`, a failed refresh) are shown to them.
+- Claude Code passes at most 10,000 characters of hook output to Claude, so the
+  digest is held under 9,000. In a very busy repo the open-PR list shrinks
+  first: descriptions go, then one line per PR, then the newest ten. The
+  collision sections are never cut.
+- Conflict lists name two files and count the rest, to keep lines short.
+
+The notice only reaches copies from 1.5.0 on: 1.4.0 and older have to be updated
+by hand once.
+
 ## 1.4.0 — 2026-10-08
 
 Stacked PRs.
